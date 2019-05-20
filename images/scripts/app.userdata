@@ -225,12 +225,17 @@ chown -h root:root "$BOOTSTRAP_MNT"/usr/local/sbin/mount-fscache
 
 # prepare a dedicated volume for caching (if it was attached as a 3rd device)
 install -d -m755 -o root -g root "$BOOTSTRAP_MNT"/etc/systemd/system/cachefilesd.service.d
-cat << "__EOF__" > "$BOOTSTRAP_MNT"/etc/systemd/system/cachefilesd.service.d/mount.conf
+cat << "__EOF__" > "$BOOTSTRAP_MNT"/etc/systemd/system/cachefilesd.service.d/override.conf
+[Unit]
+ConditionPathExists=|/sys/block/nvme1n1
+ConditionPathExists=|/sys/block/xvdc
+ConditionPathExists=|/sys/block/sdc
+
 [Service]
 ExecStartPre=/usr/local/sbin/mount-fscache
 __EOF__
-chmod 0644 "$BOOTSTRAP_MNT"/etc/systemd/system/cachefilesd.service.d/mount.conf
-chown -h root:root "$BOOTSTRAP_MNT"/etc/systemd/system/cachefilesd.service.d/mount.conf
+chmod 0644 "$BOOTSTRAP_MNT"/etc/systemd/system/cachefilesd.service.d/override.conf
+chown -h root:root "$BOOTSTRAP_MNT"/etc/systemd/system/cachefilesd.service.d/override.conf
 
 cat << "__EOF__" > "$BOOTSTRAP_MNT"/etc/systemd/system/join-ad-domain.service
 [Unit]
@@ -415,6 +420,7 @@ chroot "$BOOTSTRAP_MNT" /bin/sh -exuc "\
 	authconfig --enablesssd --enablesssdauth --update
 
 	systemctl enable chronyd haveged php-fpm postfix sssd --no-reload
+	systemctl enable cachefilesd.service --no-reload
 	systemctl enable systemd-resolved-wait-online.service --no-reload
 	systemctl enable join-ad-domain.service --no-reload
 	systemctl enable fcgi-multiplexerd.service --no-reload
