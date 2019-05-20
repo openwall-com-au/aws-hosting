@@ -29,95 +29,96 @@ To instantiate a web hosting platform the following steps are required:
 
 1. Clone this repository to a local folder on your computer
 
-    git clone https://github.com/openwall-com-au/aws-hosting
+       git clone https://github.com/openwall-com-au/aws-hosting
 
 2. Change directory to the cloned folder
 
-    cd aws-hosting
+       cd aws-hosting
 
 3. Adjust the local settings of the repository so it would play nice with AWS
    CodeCommit.
 
-    git config --local credential.helper '!aws codecommit credential-helper "$@"'
-    git config --local credential.UseHttpPath True
+       git config --local credential.helper '!aws codecommit credential-helper "$@"'
+       git config --local credential.UseHttpPath True
 
-  Alternately, you can add the following snippet to your `~/.gitconfig` file:
+   Alternately, you can add the following snippet to your `~/.gitconfig` file:
+   > Replace __<AWS_REGION>__ with the AWS Region you work with, e.g. us-west-2
 
-> Replace __<AWS_REGION>__ with the AWS Region you work with, e.g. us-west-2
-
-    [credential "https://git-codecommit.<AWS_REGION>.amazonaws.com"]
-        helper = !aws --profile nueva codecommit credential-helper $@
-        UseHttpPath = True
+       [credential "https://git-codecommit.<AWS_REGION>.amazonaws.com"]
+           helper = !aws codecommit credential-helper $@
+           UseHttpPath = True
 
 4. Deploy the loader stack first.  The stack will create an AWS S3 bucket and
    an AWS CodeCommit repository.
 
-    aws cloudformation deploy --template-file bootstrap/templates/loader.template --stack-name <STACK_NAME>
-
+       aws cloudformation deploy --template-file bootstrap/templates/loader.template --stack-name <STACK_NAME>
+ 
 5. Retrieve the output of the recently deployed stack to get the name of the
    bucket and the URL of the repository.
 
-    aws describe-stacks --stack-name next --query 'Stacks[0].Outputs[?OutputKey == `ArtifactStore` || OutputKey == `RepositoryUrl`][OutputKey, OutputValue]' --output text --stack-name <STACK_NAME>
-
-  This will produce output like the following:
-
-    ArtifactStore	<STACK_NAME>-artifactstore-XXXXXXXXXXXXX
-    RepositoryUrl	https://git-codecommit.<AWS_REGION>.amazonaws.com/v1/repos/<STACK_NAME>
+       aws describe-stacks --stack-name next --query 'Stacks[0].Outputs[?OutputKey == `ArtifactStore` || OutputKey == `RepositoryUrl`][OutputKey, OutputValue]' --output text --stack-name <STACK_NAME>
+ 
+   This will produce output like the following:
+   
+       ArtifactStore	<STACK_NAME>-artifactstore-XXXXXXXXXXXXX
+       RepositoryUrl	https://git-codecommit.<AWS_REGION>.amazonaws.com/v1/repos/<STACK_NAME>
 
 6. Prepare and push the repository to the AWS CodeCommit repository.
 
-> Replace __<REPOSITORY_NAME>__ with the value you retrieve in the previous
-  step
+   > Replace __<REPOSITORY_NAME>__ with the value you retrieve in the previous
+     step
 
-    git subtree split --prefix infrastructure -b infrastructure
-    git subtree split --prefix images -b images
-    git push --mirror <REPOSITORY_URL>
-    codecommit update-default-branch --default-branch-name master --repository-name <STACK_NAME>
+       git subtree split --prefix infrastructure -b infrastructure
+       git subtree split --prefix images -b images
+       git push --mirror <REPOSITORY_URL>
+       aws codecommit update-default-branch --default-branch-name master --repository-name <STACK_NAME>
 
 7. Prepare the primary stack for the bootstrapping.  This will adjust the
    integrated CI/CD to use the bootstrap directory for the initial pass of the
    AWS CodeBuild project.
 
-    sed 's/^\(\([[:space:]]*\)BranchName:\) infrastructure/\1 master\n\2BuildSpec: bootstrap\/buildspec.yml\n\2PrivilegedMode: true/' infrastructure/templates/infrastructure.template > infrastructure/templates/bootstrap.template 
+       sed 's/^\(\([[:space:]]*\)BranchName:\) infrastructure/\1 master\n\2BuildSpec: bootstrap\/buildspec.yml\n\2PrivilegedMode: true/' infrastructure/templates/infrastructure.template > infrastructure/templates/bootstrap.template 
 
 8. Package and deploy the bootstrapping stack.
 
-> Replace __<S3_BUCKET>__ with the value you retrieved for the `ArtifactStore`
-  in step 5
-> Replace __<KEYNAME>__ with the name of the EC2 SSH key which is already
-  defined in the selected AWS region
-> The following example deploys the stack to use 2 availability zones and
-  specifies which zones to pick, but please check the Parameters section of the
-  [infrastructure.template](infrastructure/templates/infrastructure.template)
-  to see what parameters you can configure.  All parameters are optional, but
-  ommitting some may produce less functional platform, e.g. if you skipp the
-  `DatabaseEngine` parameter there will be no RDS backend created.
+   > Replace __<S3_BUCKET>__ with the value you retrieved for the `ArtifactStore`
+     in step 5
+   
+   > Replace __<KEYNAME>__ with the name of the EC2 SSH key which is already
+     defined in the selected AWS region
+  
+   > The following example deploys the stack to use 2 availability zones and
+     specifies which zones to pick, but please check the Parameters section of the
+     [infrastructure.template](infrastructure/templates/infrastructure.template)
+     to see what parameters you can configure.  All parameters are optional, but
+     ommitting some may produce less functional platform, e.g. if you skip the
+    ` DatabaseEngine` parameter there will be no RDS backend created.
 
-    aws cloudformation package --template-file infrastructure/templates/bootstrap.template --output-template-file bootstrap.template.packaged --s3-prefix cloudformation --s3-bucket <S3_BUCKET>
-    aws cloudformation deploy --template-file bootstrap.template.packaged --capabilities CAPABILITY_NAMED_IAM CAPABILITY_AUTO_EXPAND --stack-name <STACK_NAME> --parameter-overrides DatabaseEngine=postgres KeyName=<KEYNAME> AvailabilityZones=<AWS_REGION>a,<AWS_REGION>b AvailabilityZonesCount=2 Encryption=custom-key --s3-bucket <S3_BUCKET>
+       aws cloudformation package --template-file infrastructure/templates/bootstrap.template --output-template-file bootstrap.template.packaged --s3-prefix cloudformation --s3-bucket <S3_BUCKET>
+       aws cloudformation deploy --template-file bootstrap.template.packaged --capabilities CAPABILITY_NAMED_IAM CAPABILITY_AUTO_EXPAND --stack-name <STACK_NAME> --parameter-overrides DatabaseEngine=postgres KeyName=<KEYNAME> AvailabilityZones=<AWS_REGION>a,<AWS_REGION>b AvailabilityZonesCount=2 Encryption=custom-key --s3-bucket <S3_BUCKET>
 
 9. Take a break and drink some coffee since it would take approximately 30-40
    minutes to deploy.  You can monitor the progress in the AWS CloudFormation
    and also in the AWS CodePipeline consoles.
 
 10. If everything is completed without issues and the status for all nested
-   stacks starting with the <STACK_NAME> prefix is 'UPDATE_COMPLETED' you can
-   test that the stack is working by executing the following commands:
+    stacks starting with the <STACK_NAME> prefix is 'UPDATE_COMPLETED' you can
+    test that the stack is working by executing the following commands:
 
-    ENDPOINT=$(aws cloudformation describe-stacks --stack-name n3 --query 'Stacks[0].Outputs[?OutputKey == `DNSName`][OutputValue]' --output text)
-    curl "$ENDPOINT/healthcheck"         # this tests nginx and static content service
-    curl "$ENDPOINT/healthcheck/php-fpm" # this tests PHP/FPM and dynamic content service
+        ENDPOINT=$(aws cloudformation describe-stacks --stack-name n3 --query 'Stacks[0].Outputs[?OutputKey == `DNSName`][OutputValue]' --output text)
+        curl "$ENDPOINT/healthcheck"         # this tests nginx and static content service
+        curl "$ENDPOINT/healthcheck/php-fpm" # this tests PHP/FPM and dynamic content service
+    
+    An example session is shown below:
 
-  An example session is shown below:
-
-    [galaxy@intruder aws-hosting]$ ENDPOINT=$(aws cloudformation describe-stacks --query 'Stacks[0].Outputs[?OutputKey == `DNSName`][OutputValue]' --output text --stack-name hosting)
-    [galaxy@intruder aws-hosting]$ echo "$ENDPOINT"
-    hosting-WebLoadB-GZHUZTDEFA04-520656215.us-west-2.elb.amazonaws.com
-    [galaxy@intruder aws-hosting]$ curl "$ENDPOINT/healthcheck"
-    OK Host="ip-10-0-3-14.id.hosting.internal" Date="Monday, 20-May-2019 12:27:17 UTC" Time="20/May/2019:12:27:17 +0000"
-    [galaxy@intruder aws-hosting]$ curl "$ENDPOINT/healthcheck/php-fpm" ; echo
-    OK Pool="www"
-    [galaxy@intruder aws-hosting]$
+        [galaxy@intruder aws-hosting]$ ENDPOINT=$(aws cloudformation describe-stacks --query 'Stacks[0].Outputs[?OutputKey == `DNSName`][OutputValue]' --output text --stack-name hosting)
+        [galaxy@intruder aws-hosting]$ echo "$ENDPOINT"
+        hosting-WebLoadB-GZHUZTDEFA04-520656215.us-west-2.elb.amazonaws.com
+        [galaxy@intruder aws-hosting]$ curl "$ENDPOINT/healthcheck"
+        OK Host="ip-10-0-3-14.id.hosting.internal" Date="Monday, 20-May-2019 12:27:17 UTC" Time="20/May/2019:12:27:17 +0000"
+        [galaxy@intruder aws-hosting]$ curl "$ENDPOINT/healthcheck/php-fpm" ; echo
+        OK Pool="www"
+        [galaxy@intruder aws-hosting]$
 
 The stack is now fully deployed and is ready to be used.
 
@@ -147,7 +148,7 @@ and apply your changes there.
 
 You can get the repository URL with the following command:
 
-    aws --profile nueva --region us-west-2 cloudformation describe-stacks --query 'Stacks[0].Outputs[?OutputKey == `RepositoryUrl`][OutputValue]' --output text --stack-name <STACK_NAME>
+    aws describe-stacks --query 'Stacks[0].Outputs[?OutputKey == `RepositoryUrl`][OutputValue]' --output text --stack-name <STACK_NAME>
 
 The repository contains three branches: master, images, and infrastructure .
 
@@ -249,4 +250,3 @@ the resource and push the change.  Keep in mind that you should always test the
 changes to the infrastructure branch on a separate deployment of the solution
 since a mistake in that branch may render the stack to be broken with no
 rollback or recovery option.
-
