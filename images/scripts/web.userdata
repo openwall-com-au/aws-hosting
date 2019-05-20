@@ -464,7 +464,7 @@ __EOF__
 cat << "__EOF__" > "$BOOTSTRAP_MNT"/usr/local/sbin/mount-fscache
 #!/bin/bash
 set -eu -o pipefail
-CANDIDATE=$(lsblk -d -n -p --output NAME | grep -E '/dev/((s|xv)dc|nvme2n1)$' | head -1)
+CANDIDATE=$(lsblk -d -n -p --output NAME | grep -E '/dev/((s|xv)dc|nvme1n1)$' | head -1)
 if ! OUTPUT=$(blkid "$CANDIDATE"); then
 	if [ $? -ne 2]; then
         echo 'ERROR: encountered an unrecoverable error at blkid!' >&2
