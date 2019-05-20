@@ -1,0 +1,10 @@
+#!/bin/bash
+set -eux -o pipefail
+PS4='+ [\t]	'
+
+# import variables
+. "${BASH_SOURCE%/*}/import" CICD_VARS
+
+for script in "$BASH_SOURCE".d/*.sh ; do
+	source "$script"
+done

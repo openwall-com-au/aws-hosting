@@ -1,0 +1,24 @@
+# vim:set ft=yaml ts=2 sts=2 sw=2 et:
+AWSTemplateFormatVersion: 2010-09-09
+Description: 'Web Hosting: Loader (meta-stack/bootstrap)'
+
+Resources:
+
+  ArtifactStore:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    Properties:
+      AccessControl: Private
+
+  Repository:
+    Type: AWS::CodeCommit::Repository
+    Properties: 
+      RepositoryName: !Sub ${AWS::StackName}
+
+Outputs:
+  ArtifactStore:
+    Description: The S3 bucket used for the artifact storage
+    Value: !Ref ArtifactStore
+  RepositoryUrl:
+    Description: Web hosting solution on AWS
+    Value: !GetAtt Repository.CloneUrlHttp

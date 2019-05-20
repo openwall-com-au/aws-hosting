@@ -1,0 +1,12 @@
+version: 0.2
+
+phases:
+  build:
+    commands:
+      - auto/build
+artifacts:
+  files:
+    - out/*.template
+    - out/*.parameters
+    - out/*.json
+  discard-paths: yes

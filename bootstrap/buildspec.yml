@@ -1,0 +1,21 @@
+# vim:set ft=yaml ts=2 sts=2 sw=2 et:
+# Bootstrap buildspec.yaml
+---
+version: 0.2
+
+phases:
+  install:
+    commands:
+      - bootstrap/auto/install
+  pre_build:
+    commands:
+      - bootstrap/auto/pre_build
+  build:
+    commands:
+      - bootstrap/auto/build
+
+artifacts:
+  files:
+    - bootstrap/out/*.template
+    - bootstrap/out/*.parameters
+  discard-paths: yes

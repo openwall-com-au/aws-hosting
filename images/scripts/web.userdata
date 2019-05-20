@@ -1,0 +1,701 @@
+#!/bin/bash
+
+safe_yum()
+{
+	# Sometimes we hit a bad mirror and yum fails with a timeout message, so
+	# let's try three times
+	I=0
+	until chroot "$BOOTSTRAP_MNT" yum -y "$@"
+	do
+	        RC=$?
+	        if [ $I -ge 2 ]; then
+	                echo "ERROR: yum failed 3 times with error code '$RC'!" >&2
+	                exit $RC
+	        fi
+	        echo "NOTICE: yum failed with error code '$RC', re-trying ..." >&2
+	        I=$(( I + 1 ))
+	done
+	unset I
+}
+
+[ -e "$BOOTSTRAP_MNT"/etc/resolv.conf -o -h "$BOOTSTRAP_MNT"/etc/resolv.conf ] \
+	&& mv -f "$BOOTSTRAP_MNT"/etc/resolv.conf{,.preserved} ||:
+cp -aL /etc/resolv.conf "$BOOTSTRAP_MNT"/etc/resolv.conf
+safe_yum install epel-release chrony postfix cachefilesd sudo
+safe_yum install nginx nfs-utils adcli authconfig sssd-ad haveged
+rm -f "$BOOTSTRAP_MNT"/etc/resolv.conf
+[ -e "$BOOTSTRAP_MNT"/etc/resolv.conf.preserved -o -h "$BOOTSTRAP_MNT"/etc/resolv.conf.preserved ] \
+	&& mv -f "$BOOTSTRAP_MNT"/etc/resolv.conf{.preserved,} ||:
+
+# clean up after yum
+rm -rf "$BOOTSTRAP_MNT"/var/cache/yum
+
+# time sync
+sed -i '$,/[[:space:]]*OPTIONS=/s,^\([[:space:]]*OPTIONS\)=.*,\1="-4 -F 1",' "$BOOTSTRAP_MNT"/etc/sysconfig/chronyd
+
+sed -i 's,^\([[:space:]]*server[[:space:]]\),#\1,' "$BOOTSTRAP_MNT"/etc/chrony.conf
+cat << "__EOF__" >> "$BOOTSTRAP_MNT"/etc/chrony.conf
+
+# we are using our local server
+server @@AD_DOMAIN@@ iburst
+
+# deny any external access
+deny all
+
+# randomize port
+port 0
+
+# Listen for commands only on localhost.
+bindcmdaddress 127.0.0.1
+bindcmdaddress ::1
+__EOF__
+
+cat > "$BOOTSTRAP_MNT"/usr/local/sbin/ec2-hostname.sh << "__EOF__"
+#!/bin/sh
+set -eu -o pipefail
+
+EC2_METADATA_URL='http://169.254.169.254/latest/meta-data/local-hostname'
+
+if ! OUTPUT=$(curl -qsS4f --retry 120 --retry-delay 1 "$EC2_METADATA_URL"); then
+        RC=$?
+        exit $RC
+fi
+H="${OUTPUT%%.*}"
+D="${OUTPUT#$H.}"
+
+hostnamectl set-hostname "${H}.id.${D}"
+__EOF__
+chmod 0700 "$BOOTSTRAP_MNT"/usr/local/sbin/ec2-hostname.sh
+
+cat > "$BOOTSTRAP_MNT"/etc/systemd/system/ec2-hostname.service << "__EOF__"
+[Unit]
+Description=EC2 hostname setter
+Documentation=https://none
+Requires=network-online.target
+After=systemd-networkd-wait-online.service
+Before=systemd-resolved.service
+ConditionVirtualization=vm
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/ec2-hostname.sh
+
+[Install]
+WantedBy=multi-user.target
+__EOF__
+chmod 0644 "$BOOTSTRAP_MNT"/etc/systemd/system/ec2-hostname.service
+
+# postfix
+# Avoid IPv6 initialisation in postfix
+chroot "$BOOTSTRAP_MNT" postconf -e inet_protocols=ipv4
+
+# socket-proxyd
+cat << "__EOF__" > "$BOOTSTRAP_MNT"/etc/systemd/system/systemd-socket-proxyd\@.service
+[Unit]
+Description="Generic Socket Proxy (%I)"
+Documentation=https://www.freedesktop.org/software/systemd/man/systemd-socket-proxyd.html
+After=network.service
+
+[Service]
+EnvironmentFile=-/etc/sysconfig/systemd-socket-proxyd.%i
+User=nobody
+Group=nobody
+OOMScoreAdjust=-1000
+UMask=077
+ExecStart=/usr/lib/systemd/systemd-socket-proxyd $ARGS $TARGET
+Restart=on-failure
+PrivateTmp=true
+PrivateDevices=true
+#PrivateUsers=true
+#ProtectSystem=strict
+ProtectSystem=full
+#ProtectKernelTunables=true
+#ProtectControlGroups=true
+#NoNewPrivileges=true
+#ProtectKernelModules=true
+#MemoryDenyWriteExecute=true
+__EOF__
+chmod 0644 "$BOOTSTRAP_MNT"/etc/systemd/system/systemd-socket-proxyd\@.service
+chown -h root:root "$BOOTSTRAP_MNT"/etc/systemd/system/systemd-socket-proxyd\@.service
+
+install -m755 -o root -g root -d "$BOOTSTRAP_MNT"/etc/systemd/system/systemd-socket-proxyd\@.service.d
+cat << "__EOF__" > "$BOOTSTRAP_MNT"/etc/systemd/system/systemd-socket-proxyd\@.service.d/userdata.conf
+[Unit]
+After=ec2-user-data.service
+
+[Service]
+EnvironmentFile=/run/ec2-user-data.env
+ExecStart=
+ExecStart=/usr/lib/systemd/systemd-socket-proxyd ${PHP_FPM_LB}:${PHP_FPM_LB_PORT}
+__EOF__
+chmod 0644 "$BOOTSTRAP_MNT"/etc/systemd/system/systemd-socket-proxyd\@.service.d/userdata.conf
+chown -h root:root "$BOOTSTRAP_MNT"/etc/systemd/system/systemd-socket-proxyd\@.service.d/userdata.conf
+
+cat << "__EOF__" > "$BOOTSTRAP_MNT"/etc/systemd/system/systemd-socket-proxyd\@.socket
+[Unit]
+Description="Socket for Generic Socket Proxy (%I)"
+Documentation=https://www.freedesktop.org/software/systemd/man/systemd-socket-proxyd.html
+
+[Socket]
+ListenStream=/run/systemd-socket-proxyd/%i.sock
+SocketUser=root
+SocketGroup=root
+SocketMode=0660
+DirectoryMode=0711
+
+[Install]
+WantedBy=sockets.target
+__EOF__
+chmod 0644 "$BOOTSTRAP_MNT"/etc/systemd/system/systemd-socket-proxyd\@.socket
+chown -h root:root "$BOOTSTRAP_MNT"/etc/systemd/system/systemd-socket-proxyd\@.socket
+
+install -m755 -o root -g root -d "$BOOTSTRAP_MNT"/etc/systemd/system/systemd-socket-proxyd\@.socket.d
+cat << "__EOF__" > "$BOOTSTRAP_MNT"/etc/systemd/system/systemd-socket-proxyd\@.socket.d/nginx.conf
+[Socket]
+SocketGroup=nginx
+__EOF__
+chmod 0644 "$BOOTSTRAP_MNT"/etc/systemd/system/systemd-socket-proxyd\@.socket.d/nginx.conf
+chown -h root:root "$BOOTSTRAP_MNT"/etc/systemd/system/systemd-socket-proxyd\@.socket.d/nginx.conf
+
+mkdir -p -m700 "$BOOTSTRAP_MNT"/root/policies
+mkdir -p -m700 "$BOOTSTRAP_MNT"/root/policies/systemd-socket-proxyd
+cat << "__EOF__" > "$BOOTSTRAP_MNT"/root/policies/systemd-socket-proxyd/systemd-socket-proxyd.fc
+/(usr/lib|etc)/systemd/system/systemd-socket-proxyd\.service  gen_context(system_u:object_r:systemd_socket_proxyd_unit_file_t,s0)
+/usr/lib/systemd/systemd-socket-proxyd -- gen_context(system_u:object_r:systemd_socket_proxyd_exec_t,s0)
+__EOF__
+
+cat << "__EOF__" > "$BOOTSTRAP_MNT"/root/policies/systemd-socket-proxyd/systemd-socket-proxyd.te
+policy_module(systemd-socket-proxyd, 1.0)
+
+## <desc>
+##  <p>
+##  Allow systemd-socket-proxyd to bind any port instead of one labelled
+## with systemd_socket_proxyd_port_t.
+##  </p>
+## </desc>
+gen_tunable(systemd_socket_proxyd_bind_any, false)
+
+## <desc>
+## <p>
+## Allow systemd-socket-proxyd to connect to any port instead of
+## labelled ones.
+## </p>
+## </desc>
+gen_tunable(systemd_socket_proxyd_connect_any, false)
+
+systemd_domain_template(systemd_socket_proxyd)
+
+type systemd_socket_proxyd_unit_file_t;
+systemd_unit_file(systemd_socket_proxyd_unit_file_t)
+
+sysnet_dns_name_resolve(systemd_socket_proxyd_t)
+
+# resolver
+allow systemd_socket_proxyd_t self:unix_dgram_socket { create getopt setopt sendto read write };
+
+# listener
+type systemd_socket_proxyd_port_t;
+corenet_port(systemd_socket_proxyd_port_t);
+allow systemd_socket_proxyd_t self:tcp_socket accept;
+
+tunable_policy(`!systemd_socket_proxyd_bind_any',`
+ allow systemd_socket_proxyd_t systemd_socket_proxyd_port_t:tcp_socket name_bind;
+')
+
+tunable_policy(`systemd_socket_proxyd_bind_any',`
+ corenet_tcp_bind_all_ports(systemd_socket_proxyd_t)
+')
+
+# target
+tunable_policy(`!systemd_socket_proxyd_connect_any',`
+ allow systemd_socket_proxyd_t port_type:tcp_socket name_connect;
+')
+
+tunable_policy(`systemd_socket_proxyd_connect_any',`
+ corenet_tcp_connect_all_ports(systemd_socket_proxyd_t)
+')
+
+# consumer
+allow daemon systemd_socket_proxyd_t:unix_stream_socket connectto;
+__EOF__
+
+base64 -d << "__EOF__" | xzcat > "$BOOTSTRAP_MNT"/root/policies/systemd-socket-proxyd/systemd-socket-proxyd.pp
+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
+__EOF__
+
+# disable IPv6
+sed -i 's,^\([[:space:]]*\)\(listen[[:space:]]\+\[::.*\),\1#\2,g' "$BOOTSTRAP_MNT"/etc/nginx/nginx.conf
+
+cat << "__EOF__" > "$BOOTSTRAP_MNT"/etc/nginx/default.d/healthcheck.conf
+location = /healthcheck {
+	access_log off;
+	add_header Content-Type text/plain;
+	return 200 "OK Host=\"$hostname\" Date=\"$date_local\" Time=\"$time_local\"\n";
+}
+
+location = /healthcheck/php-fpm {
+	access_log off;
+	fastcgi_buffers 16 16k;
+	fastcgi_buffer_size 32k;
+
+	include fastcgi_params;
+	fastcgi_pass	@@PHP_DNS@@:@@PHP_PORT@@;
+	fastcgi_param	HTTPS   $fastcgi_https;
+	fastcgi_param	SCRIPT_NAME /healthcheck/php-fpm;
+	fastcgi_param	SCRIPT_FILENAME /dev/null;
+	fastcgi_param	REQUEST_METHOD GET;
+	fastcgi_param	FCGI_POOL www;
+}
+__EOF__
+chmod 0644 "$BOOTSTRAP_MNT"/etc/nginx/default.d/*.conf
+chown -h root:root "$BOOTSTRAP_MNT"/etc/nginx/default.d/*.conf
+
+cat << "__EOF__" > "$BOOTSTRAP_MNT"/etc/nginx/conf.d/fastcgi.conf
+fastcgi_cache_path	/var/cache/nginx/content/fastcgi-cache
+			levels=1:2 keys_zone=fastcgi-cache:1m inactive=60m;
+fastcgi_cache		fastcgi-cache;
+fastcgi_cache_key	"$scheme|$request_method|$host|$request_uri";
+__EOF__
+cat << "__EOF__" > "$BOOTSTRAP_MNT"/etc/nginx/conf.d/log_format.conf
+log_format postdata '$remote_addr - $remote_user [$time_local] "$request" $status $bytes_sent $request_body';
+__EOF__
+# XXX: set_real_ip_from should use the subnet variable
+cat << __EOF__ > "$BOOTSTRAP_MNT"/etc/nginx/conf.d/real_ip.conf
+real_ip_header X-Forwarded-For;
+set_real_ip_from @@VPC_PUBLIC_CIDR@@;
+__EOF__
+cat << "__EOF__" > "$BOOTSTRAP_MNT"/etc/nginx/conf.d/server_tokens.conf
+server_tokens off;
+__EOF__
+cat << "__EOF__" > "$BOOTSTRAP_MNT"/etc/nginx/conf.d/ssl_at_lb.conf
+map $http_x_forwarded_proto $fastcgi_https {
+	https on;
+}
+__EOF__
+cat << "__EOF__" > "$BOOTSTRAP_MNT"/etc/nginx/conf.d/virtwww.conf
+add_header X-Serving-Backend "$hostname t=$request_time";
+server_names_hash_bucket_size  128;
+include /usr/share/etc/nginx/sites-enabled/*.conf;
+__EOF__
+chmod 0644 "$BOOTSTRAP_MNT"/etc/nginx/conf.d/*.conf
+chown -h root:root "$BOOTSTRAP_MNT"/etc/nginx/conf.d/*.conf
+
+install -d -m755 -o root -g root "$BOOTSTRAP_MNT"/etc/systemd/system/nginx.service.d
+cat << "__EOF__" > "$BOOTSTRAP_MNT"/etc/systemd/system/nginx.service.d/local.conf
+[Unit]
+Requires=usr-share-etc-nginx.mount home-websites-logs-nginx.mount sssd.service
+After=usr-share-etc-nginx.mount home-websites-logs-nginx.mount sssd.service
+__EOF__
+chmod 0644 "$BOOTSTRAP_MNT"/etc/systemd/system/nginx.service.d/local.conf
+chown -h root:root "$BOOTSTRAP_MNT"/etc/systemd/system/nginx.service.d/local.conf
+
+cat << "__EOF__" >> "$BOOTSTRAP_MNT"/etc/fstab
+LABEL=fs-cache	/var/cache/fscache	ext4	noauto,nosuid,noexec,nodev,noatime,nofail	0 2
+
+@@EFS_DNS@@:/etc/nginx		/usr/share/etc/nginx	nfs4	nfsvers=4.1,rsize=1048576,wsize=1048576,hard,timeo=600,retrans=2,nosuid,noexec,nodev	0 0
+@@EFS_DNS@@:/home		/home			nfs4	ro,nfsvers=4.1,rsize=1048576,wsize=1048576,hard,timeo=600,retrans=2,nosuid,nodev	0 0
+
+@@EFS_DNS@@:/home/websites/logs/nginx	/home/websites/logs/nginx	nfs4	rw,nfsvers=4.1,rsize=1048576,wsize=1048576,hard,timeo=600,retrans=2,nosuid,nodev	0 0
+__EOF__
+
+cat << "__EOF__" > "$BOOTSTRAP_MNT"/usr/local/sbin/mount-fscache
+#!/bin/bash
+set -eu -o pipefail
+CANDIDATE=$(lsblk -d -n -p --output NAME | grep -E '/dev/((s|xv)dc|nvme2n1)$' | head -1)
+if ! OUTPUT=$(blkid "$CANDIDATE"); then
+	if [ $? -ne 2]; then
+        echo 'ERROR: encountered an unrecoverable error at blkid!' >&2
+        exit 1
+	fi
+fi
+
+if [ -z "$OUTPUT" ]; then
+        if ! mke2fs -t ext4 -L fs-cache -m0 -M /var/cache/fscache "$CANDIDATE"; then
+                echo 'ERROR: encountered an unrecoverable errori at mke2fs!' >&2
+                exit 1
+        fi
+        if ! tune2fs -c 0 -i 0 "$CANDIDATE"; then
+                echo 'ERROR: encountered an unrecoverable error at tune2fs!' >&2
+                exit 1
+        fi
+fi
+
+if ! OUTPUT=$(blkid -L fs-cache); then
+	echo 'ERROR: encountered an unrecoverable error at blkid (2)!' >&2
+        exit 1
+fi
+
+if [ -n "$OUTPUT" ]; then
+	if ! mountpoint -q /var/cache/fscache; then
+		mount /var/cache/fscache
+		restorecon -R /var/cache/fscache
+	fi
+fi
+__EOF__
+chmod 0700 "$BOOTSTRAP_MNT"/usr/local/sbin/mount-fscache
+chown -h root:root "$BOOTSTRAP_MNT"/usr/local/sbin/mount-fscache
+
+# prepare a dedicated volume for caching (if it was attached as a 3rd device)
+install -d -m755 -o root -g root "$BOOTSTRAP_MNT"/etc/systemd/system/cachefilesd.service.d
+cat << "__EOF__" > "$BOOTSTRAP_MNT"/etc/systemd/system/cachefilesd.service.d/mount.conf
+[Service]
+ExecStartPre=/usr/local/sbin/mount-fscache
+__EOF__
+chmod 0644 "$BOOTSTRAP_MNT"/etc/systemd/system/cachefilesd.service.d/mount.conf
+chown -h root:root "$BOOTSTRAP_MNT"/etc/systemd/system/cachefilesd.service.d/mount.conf
+
+cat << "__EOF__" > "$BOOTSTRAP_MNT"/etc/systemd/system/join-ad-domain.service
+[Unit]
+Description=AD domain join
+Documentation=https://none
+Wants=network-online.target
+Requires=ec2-user-data.service ec2-hostname.service
+After=network-online.target ec2-user-data.service ec2-hostname.service
+Before=sssd.service
+ConditionPathExists=!/etc/krb5.keytab
+
+[Service]
+Type=oneshot
+EnvironmentFile=-/run/ec2-user-data.env
+ExecStart=/usr/local/sbin/join-ad-domain.sh $AD_USER $AD_DOMAIN $AD_PASS
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target
+__EOF__
+chmod 0644 "$BOOTSTRAP_MNT"/etc/systemd/system/join-ad-domain.service
+chown -h root:root "$BOOTSTRAP_MNT"/etc/systemd/system/join-ad-domain.service
+
+cat << "__EOF__" > "$BOOTSTRAP_MNT"/usr/local/sbin/join-ad-domain.sh
+#!/bin/bash
+AD_USER="${1:-@@AD_JOIN_USER@@}"
+AD_DOMAIN="${2:-@@AD_DOMAIN@@}"
+AD_PASS="${3:-@@AD_JOIN_PASS@@}"
+printf '%s' "$AD_PASS" | \
+        adcli join -v --stdin-password --show-details -U "$AD_USER" "$AD_DOMAIN"
+__EOF__
+chmod 0700 "$BOOTSTRAP_MNT"/usr/local/sbin/join-ad-domain.sh
+chown -h root:root "$BOOTSTRAP_MNT"/usr/local/sbin/join-ad-domain.sh
+
+cat << "__EOF__" > "$BOOTSTRAP_MNT"/etc/sssd/sssd.conf
+[sssd]
+domains = @@AD_DOMAIN@@, admin
+config_file_version = 2
+services = nss, pam, ssh
+
+[domain/@@AD_DOMAIN@@]
+ad_domain = @@AD_DOMAIN@@
+krb5_realm = @@AD_DOMAIN@@
+cache_credentials = True
+krb5_store_password_if_offline = True
+default_shell = /bin/bash
+ldap_id_mapping = True
+ldap_schema = ad
+ldap_search_base = @@LDAP_BASE@@
+ldap_idmap_autorid_compat = True
+ldap_idmap_default_domain = @@AD_DOMAIN@@
+fallback_homedir = /home/websites/%u
+use_fully_qualified_names = False
+id_provider = ad
+chpass_provider = ad
+access_provider = ad
+ad_access_filter = (&(memberOf=cn=virtwww,ou=Hosting,@@LDAP_BASE@@)(unixHomeDirectory=*))
+sudo_provider = none
+autofs_provider = none
+dyndns_update = True
+auto_private_groups = True
+
+[domain/admin]
+ad_domain = @@AD_DOMAIN@@
+krb5_realm = @@AD_DOMAIN@@
+cache_credentials = True
+krb5_store_password_if_offline = True
+default_shell = /bin/bash
+ldap_id_mapping = True
+ldap_schema = ad
+ldap_search_base = @@LDAP_BASE@@
+ldap_idmap_autorid_compat = True
+ldap_idmap_default_domain = @@AD_DOMAIN@@
+fallback_homedir = /home/users/%u
+use_fully_qualified_names = True
+id_provider = ad
+chpass_provider = ad
+access_provider = ad
+ad_access_filter = (&(memberOf=cn=admin,ou=Hosting,@@LDAP_BASE@@)(unixHomeDirectory=*))
+sudo_provider = none
+autofs_provider = none
+dyndns_update = False
+auto_private_groups = True
+ldap_user_ssh_public_key = comment
+__EOF__
+chmod 0600 "$BOOTSTRAP_MNT"/etc/sssd/sssd.conf
+chown -h root:root "$BOOTSTRAP_MNT"/etc/sssd/sssd.conf
+
+cat << "__EOF__" > "$BOOTSTRAP_MNT"/etc/sudoers.d/admin
+%admin	ALL=(ALL)	NOPASSWD: ALL
+__EOF__
+chmod 0440 "$BOOTSTRAP_MNT"/etc/sudoers.d/admin
+chown -h root:root "$BOOTSTRAP_MNT"/etc/sudoers.d/admin
+
+sed -i 's#chmod 0700 /usr/bin/sudo[[:space:]]*$#chgrp -h admin /usr/bin/sudo ; chmod u=sx,g=x,o= /usr/bin/sudo#g' "$BOOTSTRAP_MNT"/etc/yum/post-actions/check-sugid.action
+
+cat << "__EOF__" > "$BOOTSTRAP_MNT"/usr/local/sbin/authorized_keys_from_ad
+#!/bin/bash
+exec /usr/bin/sss_ssh_authorizedkeys "$@"
+__EOF__
+chmod 0750 "$BOOTSTRAP_MNT"/usr/local/sbin/authorized_keys_from_ad
+chown -h root:nobody "$BOOTSTRAP_MNT"/usr/local/sbin/authorized_keys_from_ad
+
+sed -i 's,^[[:space:]]*#\?[[:space:]]*AuthorizedKeysCommand[[:space:]].*,AuthorizedKeysCommand /usr/local/sbin/authorized_keys_from_ad,;s,^[[:space:]]*#\?[[:space:]]*AuthorizedKeysCommandUser[[:space:]].*,AuthorizedKeysCommandUser nobody,' \
+	"$BOOTSTRAP_MNT"/etc/ssh/sshd_config
+
+# The bootstraping code should have already created this directory,
+# but if it is not there, lets create it.
+mkdir -p -m0700 "$BOOTSTRAP_MNT"/root/bootstrap.d
+
+cat << "__EOF__" > "$BOOTSTRAP_MNT"/root/bootstrap.d/000-init.sh
+set -eu -o pipefail
+
+INSTANCE_DOC=$(curl -qsS4f --retry 60 --retry-delay 1 http://169.254.169.254/latest/dynamic/instance-identity/document)
+AWS_DEFAULT_REGION=$(printf '%s' "$INSTANCE_DOC" | sed -n 's|.*"region"[[:space:]]*:[[:space:]]*"\([^"]\+\)".*|\1|g;T;p' | tail -1)
+INSTANCE_ID=$(printf '%s' "$INSTANCE_DOC" | sed -n 's|.*"instanceId"[[:space:]]*:[[:space:]]*"\([^"]\+\)".*|\1|g;T;p' | tail -1)
+export AWS_DEFAULT_REGION
+
+trap '
+	RC=$?
+	trap - ERR HUP INT QUIT PIPE EXIT
+	[ -z "${STACK_NAME:-}" ] || \
+	aws cloudformation signal-resource \
+		--stack-name "${STACK_NAME:-NoStack}" \
+		--logical-resource-id AutoScalingGroup \
+		--unique-id "$INSTANCE_ID" \
+		--status FAILURE
+	exit $RC
+' ERR HUP INT QUIT PIPE EXIT
+__EOF__
+
+cat << "__EOF__" > "$BOOTSTRAP_MNT"/root/bootstrap.d/015-sssd.sh
+	# We rely on sssd being up and running and being able to retrieve info, so let's check it
+	for attempt in {1..9}
+	do
+		RC=0
+		getent group admin >/dev/null 2>&1 || RC=$?
+		[ $RC -ne 0 ] || break
+		sleep 5
+	done
+__EOF__
+
+cat << "__EOF__" > "$BOOTSTRAP_MNT"/root/bootstrap.d/025-sudo.sh
+FIX_SUDO=$(grep '^/usr/bin/sudo:update' /etc/yum/post-actions/check-sugid.action | tail -1 | cut -f3- -d:)
+[ -z "$FIX_SUDO" ] || eval "$FIX_SUDO"
+__EOF__
+
+cat << "__EOF__" > "$BOOTSTRAP_MNT"/root/bootstrap.d/030-selinux.sh
+semanage login --add -s root -r s0-s0:c0.c1023 %admin
+__EOF__
+
+cat << "__EOF__" > "$BOOTSTRAP_MNT"/root/bootstrap.d/999-epilogue.sh
+[ -z "${STACK_NAME:-}" ] || \
+aws cloudformation signal-resource --stack-name "${STACK_NAME:-NoStack}" --logical-resource-id AutoScalingGroup --unique-id "$INSTANCE_ID" --status SUCCESS ||:
+trap - EXIT
+__EOF__
+
+chmod 0600 "$BOOTSTRAP_MNT"/root/bootstrap.d/*.sh
+chown -h root:root "$BOOTSTRAP_MNT"/root/bootstrap.d/*.sh
+
+chroot "$BOOTSTRAP_MNT" /bin/sh -exuc "\
+	semodule -N -i /root/policies/systemd-socket-proxyd/systemd-socket-proxyd.pp
+
+	semanage boolean -N --modify --on use_nfs_home_dirs
+	semanage boolean -N --modify --on httpd_use_nfs
+
+	semanage fcontext -a -e /etc /usr/share/etc
+	mkdir -m0755 /usr/share/etc
+	mkdir -m0 /usr/share/etc/nginx
+	restorecon -Rv /usr/share/etc
+	chattr +i /usr/share/etc/nginx
+
+	mkdir -m750 /var/cache/nginx{,/content}
+	chown -Rh root:nginx /var/cache/nginx
+	mkdir -m700 /var/cache/nginx/content/fastcgi-cache
+	chown -h nginx:nginx /var/cache/nginx/content/fastcgi-cache
+
+	semanage fcontext -a -e /home /home/websites
+	mkdir -m0 /home/websites
+	chattr +i /home/websites
+
+	authconfig --enablesssd --enablesssdauth --update
+
+	systemctl enable chronyd haveged nginx postfix sssd --no-reload
+	systemctl enable systemd-socket-proxyd@fastcgi.socket --no-reload
+	systemctl enable systemd-resolved-wait-online.service --no-reload
+	systemctl enable join-ad-domain.service --no-reload
+
+	systemctl disable rpcbind.{service,socket} --no-reload
+	systemctl mask auth-rpcgss-module.service --no-reload
+
+	printf '\n%s\n%s\n' 'set -x' 'for s in /root/bootstrap.d/*.sh ; do . \$s ; done' >> /usr/local/sbin/ec2-bootstrap.sh
+"

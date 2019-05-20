@@ -1,0 +1,17 @@
+#!/bin/bash
+set -eu -o pipefail
+if [ "${0##*/}" == import ]
+then
+	echo "ERROR: the '${0##*/}' snippet is not supposed to be called directly!" >&2
+	exit 1
+fi
+
+TGT="${1:-}"
+
+[ -n "${!TGT:-}" ] && [ "${!TGT/=}" != "${!TGT}" ] && \
+echo "Importing variables from '$TGT' ..." && \
+while read LINE
+do
+	declare -x "${LINE%%=*}=${LINE#*=}"
+	echo "${LINE%%=*}=${LINE#*=}"
+done <<< $(printf '%s' "${!TGT}" | sed 's,\\n,\n,g' | sed -n '1{h;n};/=/{x;p;x;h};/=/!{H;x;s/\n/,/;x};${x;s,$,\n,;p}')

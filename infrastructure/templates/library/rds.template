@@ -1,0 +1,301 @@
+# vim:set ft=yaml ts=2 sts=2 sw=2 et:
+---
+AWSTemplateFormatVersion: 2010-09-09
+Description: An RDS instance
+Parameters:
+  AllocatedStorage:
+    Description: The allocated storage size specified in gigabytes (GB)
+    Type: Number
+    MinValue: 5
+    Default: 20
+  AllowMajorVersionUpgrade:
+    Description: Indicates whether major version upgrades are allowed (Boolean)
+    Type: String
+    AllowedValues: [ true, false, '' ]
+    Default: ''
+  AutoMinorVersionUpgrade:
+    Description: >-
+      Indicates that minor engine upgrades will be applied automatically to the
+      DB instance during the maintenance window (Boolean)
+    Type: String
+    AllowedValues: [ true, false, '' ]
+    Default: ''
+  BackupRetentionPeriod:
+    Description: The number of days for which automatic DB snapshots are retained
+    Type: String
+    Default: ''
+  DBInstanceClass:
+    Description: The name of the compute and memory capacity class of the DB instance
+    Type: String
+    Default: db.t2.small
+  DBInstanceIdentifier:
+    Description: >-
+      ID for this instance.  If you specify a value the instance will be automatically
+      protected from updates that require replacement of the instance.
+    Type: String
+    Default: ''
+  DBName:
+    Description: The name of the initial database of this instance
+    Type: String
+    MinLength: 0
+    MaxLength: 63
+    Default: ''
+  DBParameterGroupName:
+    Description: The name of an existing DB parameter group
+    Type: String
+    Default: ''
+  DBSnapshotIdentifier:
+    Description: >-
+      The identifier for the DB snapshot to restore from (leave empty for a new
+      database)
+    Type: String
+    Default: ''
+  DBSubnetGroupName:
+    Description: >-
+      A DB subnet group to associate with the DB instance (if empty will create
+      a group using all private subnets in the VPC)
+    Type: String
+    Default: ''
+  Engine:
+    Description: The name of the database engine that the DB instance uses
+    Type: String
+    AllowedValues:
+      - MySQL
+      - mariadb
+      - oracle-se1
+      - oracle-se
+      - oracle-ee
+      - sqlserver-ee
+      - sqlserver-se
+      - sqlserver-ex
+      - sqlserver-web
+      - postgres
+      - aurora
+      - ''
+    Default: mariadb
+  EngineVersion:
+    Description: The version number of the database engine to use
+    Type: String
+    Default: ''
+  HostedZoneName:
+    Description: The Route53 hosted zone name to use
+    Type: String
+    Default: ''
+  HostName:
+    Description: Host name to attach to this RDS if you want one
+    Type: String
+    Default: ''
+  Iops:
+    Description: >-
+      The number of I/O operations per second (IOPS) that the database
+      provisions. The value must be equal to or greater than 1000
+    Type: Number
+    Default: 0
+  KmsKeyId:
+    Description: >-
+      The Amazon Resource Name (ARN) of the AWS Key Management Service master
+      key that is used to encrypt the database instance
+    Type: String
+    Default: ''
+  MasterUsername:
+    Description: The master user name for the database instance
+    Type: String
+    Default: ''
+  MasterUserPassword:
+    Description: The master password for the database instance
+    Type: String
+    AllowedPattern: '^(.........*)?$' # empty or 8+ characters
+    NoEcho: true
+    Default: ''
+  MultiAZ:
+    Description: >-
+      Specifies if the database instance is a multiple Availability Zone
+      deployment
+    Type: String
+    Default: ''
+  OptionGroupName:
+    Description: An option group that this database instance is associated with
+    Type: String
+    Default: ''
+  Port:
+    Description: The port for the instance
+    Type: String
+    Default: ''
+  PreferredBackupWindow:
+    Description: >-
+      The daily time range during which automated backups are created if
+      automated backups are enabled, as determined by the BackupRetentionPeriod
+    Type: String
+    Default: ''
+  PreferredMaintenanceWindow:
+    Description: The weekly time range (in UTC) during which system maintenance can occur
+    Type: String
+    Default: ''
+  PubliclyAccessible:
+    Description: >-
+      Indicates whether the database instance is an Internet-facing instance. If
+      you specify true, an instance is created with a publicly resolvable DNS
+      name, which resolves to a public IP address. If you specify false, an
+      internal instance is created with a DNS name that resolves to a private IP
+      address
+    Type: String
+    AllowedValues: [ true, false ]
+    Default: false
+  SourceDBInstanceIdentifier:
+    Description: >-
+      If you want to create a read replica DB instance, specify the ID of the
+      source database instance
+    Type: String
+    Default: ''
+  StorageEncrypted:
+    Description: Indicates whether the database instance is encrypted
+    Type: String
+    AllowedValues: [ true, false ]
+    Default: false
+  StorageType:
+    Description: >-
+      The storage type associated with this database instance (standard, gp2,
+      io1)
+    Type: String
+    AllowedValues: [ standard, gp2, io1, '' ]
+    Default: ''
+  SubnetIds:
+    Description: >-
+      A comma delimited list of subnets in the VPC to use as a group to deploy
+      RDS instances into
+    Type: CommaDelimitedList
+    Default: ''
+  VPCSecurityGroups:
+    Description: A comma delimited list of Security Group Ids to assign to the RDS instance
+    Type: CommaDelimitedList
+    Default: ''
+
+Conditions:
+  useAllowMajorVersionUpgrade: !Not [ !Equals [ '', !Ref AllowMajorVersionUpgrade ]]
+  useAutoMinorVersionUpgrade: !Not [ !Equals [ '', !Ref AutoMinorVersionUpgrade ]]
+  useBackupRetentionPeriod: !Not [ !Equals [ '', !Ref BackupRetentionPeriod ]]
+  useDBName: !Not [ !Equals [ '', !Ref DBName ]]
+  useDBParameterGroupName: !Not [ !Equals [ '', !Ref DBParameterGroupName ]]
+  useDBSnapshotIdentifier: !Not [ !Equals [ '', !Ref DBSnapshotIdentifier ]]
+  useDBInstanceIdentifier: !Not [ !Equals [ '', !Ref DBInstanceIdentifier ]]
+  useDBSubnetGroupName: !Not [ !Equals [ '', !Ref DBSubnetGroupName ]]
+  useEngineVersion: !Not [ !Equals [ '', !Ref EngineVersion ]]
+  useIops: !Not [ !Equals [ 0, !Ref Iops ]]
+  useKmsKeyId: !Not [ !Equals [ '', !Ref KmsKeyId ]]
+  useMultiAZ: !Not [ !Equals [ '', !Ref MultiAZ ]]
+  useOptionGroupName: !Not [ !Equals [ '', !Ref OptionGroupName ]]
+  usePort: !Not [ !Equals [ '', !Ref Port ]]
+  usePreferredBackupWindow: !Not [ !Equals [ '', !Ref PreferredBackupWindow ]]
+  usePreferredMaintenanceWindow: !Not [ !Equals [ '', !Ref PreferredMaintenanceWindow ]]
+  useSourceDBInstanceIdentifier: !Not [ !Equals [ '', !Ref SourceDBInstanceIdentifier ]]
+  useStorageEncrypted: !Equals [ true, !Ref StorageEncrypted ]
+  useStorageType: !Not [ !Equals [ '', !Ref StorageType ]]
+  useVPCSecurityGroups: !Not [ !Equals [ '', !Join [ '', !Ref VPCSecurityGroups ]]]
+  createDBSubnetGroup: !And
+    - !Equals [ '', !Ref DBSubnetGroupName ]
+    - !Not [ !Equals [ '', !Join [ '', !Ref SubnetIds ]]]
+  createDNSRecord: !And
+    - !Not [ !Equals [ '', !Ref HostedZoneName ]]
+    - !Not [ !Equals [ '', !Ref HostName ]]
+  useSecretsManager: !Equals [ '', !Ref MasterUserPassword ]
+  useMasterUserPassword: !Not [ !Equals [ '', !Ref MasterUserPassword ]]
+  useDynamicPassword: !And
+    - !Not [ !Equals [ '', !Ref MasterUserPassword ]]
+    - !Equals [ 'resolve', !Select [0, !Split [ ':', !Ref MasterUserPassword ]]]
+
+Resources:
+  secretRDS:
+    Condition: useSecretsManager
+    Type: "AWS::SecretsManager::Secret"
+    Properties:
+      Description: !Sub Credentials for the RDS Service in the ${AWS::StackName} stack
+      GenerateSecretString:
+        SecretStringTemplate: !Sub '{"username": "${MasterUsername}"}'
+        GenerateStringKey: "password"
+        PasswordLength: 30
+        ExcludeCharacters: '"@/\'
+      Tags:
+        - Key: Name
+          Value: database
+
+  DBSubnetGroup:
+    Type: AWS::RDS::DBSubnetGroup
+    Condition: createDBSubnetGroup
+    Properties:
+      DBSubnetGroupDescription: A subnet group where RDS instance will be launched into
+      SubnetIds: !Ref SubnetIds
+
+  RDS:
+    Type: AWS::RDS::DBInstance
+    Properties:
+      AllocatedStorage: !Ref AllocatedStorage
+      AllowMajorVersionUpgrade: !If [ useAllowMajorVersionUpgrade, !Ref AllowMajorVersionUpgrade, !Ref 'AWS::NoValue' ]
+      AutoMinorVersionUpgrade: !If [ useAutoMinorVersionUpgrade, !Ref AutoMinorVersionUpgrade, !Ref 'AWS::NoValue' ]
+      BackupRetentionPeriod: !If [ useBackupRetentionPeriod, !Ref BackupRetentionPeriod, !Ref 'AWS::NoValue' ]
+      DBInstanceClass: !Ref DBInstanceClass
+      DBName: !If [ useDBName, !Ref DBName, !Ref 'AWS::NoValue' ]
+      DBParameterGroupName: !If [ useDBParameterGroupName, !Ref DBParameterGroupName, !Ref 'AWS::NoValue' ]
+      DBSnapshotIdentifier: !If [ useDBSnapshotIdentifier, !Ref DBSnapshotIdentifier, !Ref 'AWS::NoValue' ]
+      DBInstanceIdentifier: !If [ useDBInstanceIdentifier, !Ref DBInstanceIdentifier, !Ref 'AWS::NoValue' ]
+      DBSubnetGroupName: !If 
+        - createDBSubnetGroup
+        - !Ref DBSubnetGroup
+        - !If [ useDBSubnetGroupName, !Ref DBSubnetGroupName, !Ref 'AWS::NoValue' ]
+      Engine: !Ref Engine
+      EngineVersion: !If [ useEngineVersion, !Ref EngineVersion, !Ref 'AWS::NoValue' ]
+      Iops: !If [ useIops, !Ref Iops, !Ref 'AWS::NoValue' ]
+      MasterUsername: !Ref MasterUsername
+      MasterUserPassword: !If
+        - useMasterUserPassword
+        - !If
+          - useDynamicPassword
+          - !Sub '{{${MasterUserPassword}}}'
+          - !Ref MasterUserPassword
+        - !Sub '{{resolve:secretsmanager:${secretRDS}:SecretString:password}}'
+      MultiAZ: !If [ useMultiAZ, !Ref MultiAZ, !Ref 'AWS::NoValue' ]
+      OptionGroupName: !If [ useOptionGroupName, !Ref OptionGroupName, !Ref 'AWS::NoValue' ]
+      Port: !If [ usePort, !Ref Port, !Ref 'AWS::NoValue' ]
+      PreferredBackupWindow: !If [ usePreferredBackupWindow, !Ref PreferredBackupWindow, !Ref 'AWS::NoValue' ]
+      PreferredMaintenanceWindow: !If [ usePreferredMaintenanceWindow, !Ref PreferredMaintenanceWindow, !Ref 'AWS::NoValue' ]
+      PubliclyAccessible: !Ref PubliclyAccessible
+      SourceDBInstanceIdentifier: !If [ useSourceDBInstanceIdentifier, !Ref SourceDBInstanceIdentifier, !Ref 'AWS::NoValue' ]
+      KmsKeyId: !If [ useKmsKeyId, !Ref KmsKeyId, !Ref 'AWS::NoValue' ]
+      StorageEncrypted: !If 
+        - useKmsKeyId
+        - true
+        - !If [ useStorageEncrypted, !Ref StorageEncrypted, !Ref 'AWS::NoValue' ]
+      StorageType: !If 
+        - useStorageType
+        - !Ref StorageType
+        - !If [ useIops, io2, standard ]
+      VPCSecurityGroups: !If [ useVPCSecurityGroups, !Ref VPCSecurityGroups, !Ref 'AWS::NoValue' ]
+    DeletionPolicy: Snapshot
+
+  secretRDSInstanceAttachment:
+    Condition: useSecretsManager
+    Type: AWS::SecretsManager::SecretTargetAttachment
+    Properties:
+      SecretId: !Ref secretRDS
+      TargetId: !Ref RDS
+      TargetType: AWS::RDS::DBInstance
+
+  DNSRecord:
+    Condition: createDNSRecord
+    Type: AWS::Route53::RecordSet
+    Properties:
+      HostedZoneName: !Ref HostedZoneName
+      Name: !Sub ${HostName}.${HostedZoneName}
+      Type: CNAME
+      TTL: 60
+      ResourceRecords:
+        - !GetAtt [ RDS, Endpoint.Address ]
+Outputs:
+  RdsId:
+    Description: The Id of the created RDS instance
+    Value: !Ref RDS
+  Endpoint:
+    Description: The endpoint address for the created RDS instance
+    Value: !GetAtt [ RDS, Endpoint.Address ]
+  EndpointPort:
+    Description: The endpoint port for the created RDS instance
+    Value: !GetAtt [ RDS, Endpoint.Port ]

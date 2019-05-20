@@ -1,0 +1,94 @@
+# vim:set ft=yaml ts=2 sts=2 sw=2 et:
+# ToDo:
+# - Custom Lambda that generates a password (before SimpleAD is created)
+# - Custom Lambda that configures the Joiners group and an account
+# - Backup strategy (scheduled Lambda to rotate through 5 manual snapshots)
+---
+AWSTemplateFormatVersion: 2010-09-09
+Description: AWS Simple Active Directory Service
+Parameters:
+  Description:
+    Description: The description for the Directory service
+    Type: String
+    Default: ''
+  Alias:
+    Description: Whether AWS needs to create an alias for this AD or not
+    Type: String
+    AllowedValues: [ true, false ]
+    Default: false
+  SSO:
+    Description: Whether Single Sign-On (SSO) should be enabled
+    Type: String
+    AllowedValues: [ true, false ]
+    Default: false
+  Name:
+    Description: The fully qualified domain name for the Directory
+    Type: String
+    MinLength: 3
+    MaxLength: 128
+    AllowedPattern: '^([a-zA-Z0-9]+[\\.-])+([a-zA-Z0-9])+$'
+  Password:
+    Description: The password for the Directory administrator
+    Type: String
+    Default: ''
+    AllowedPattern: '^(.........*)?$' # empty or 8+ characters
+    NoEcho: true
+  ShortName:
+    Description: The NetBIOS name for the Directory
+    Type: String
+    Default: ''
+  Size:
+    Description: The size of the Directory
+    Type: String
+    AllowedValues: [ Small, Large ]
+    Default: Small
+    ConstraintDescription: must be either 'Small' or 'Large'
+  SubnetIds:
+    Description: A list of two subnet IDs for the Directory servers
+    Type: List<AWS::EC2::Subnet::Id>
+  VpcId:
+    Description: The ID of the VPC this Directory will be deployed to
+    Type: AWS::EC2::VPC::Id
+
+Conditions:
+  useDescription: !Not [ !Equals [ '', !Ref Description ]]
+  useShortName: !Not [ !Equals [ '', !Ref ShortName ]]
+  usePassword: !Not [ !Equals [ '', !Ref Password ]]
+  useDynamicPassword: !And
+    - !Not [ !Equals [ '', !Ref Password ]]
+    - !Equals [ 'resolve', !Select [0, !Split [ ':', !Ref Password ]]]
+
+Resources:
+  SimpleAD:
+    Type: AWS::DirectoryService::SimpleAD
+    Properties:
+      CreateAlias: !Ref Alias
+      Description: !If [ useDescription, !Ref Description, '!Ref AWS::NoValue' ]
+      EnableSso: !Ref SSO
+      Name: !Ref Name
+      Password: !If
+        - usePassword
+        - !If
+          - useDynamicPassword
+          - !Sub '{{${Password}}}'
+          - !Ref Password
+        - !Ref VpcId
+      ShortName: !If [ useShortName, !Ref ShortName, '!Ref AWS::NoValue' ]
+      Size: !Ref Size
+      VpcSettings:
+        SubnetIds: !Ref SubnetIds
+        VpcId: !Ref VpcId
+
+Outputs:
+  Id:
+    Description: The ID of the created SimpleAD
+    Value: !Ref SimpleAD
+  Name:
+    Description: The fully qualified DNS name for the directory.
+    Value: !Ref Name
+  Alias:
+    Description: The alias for the directory.
+    Value: !GetAtt SimpleAD.Alias
+  DnsIpAddresses:
+    Description: The IP addresses of the DNS servers for the directory
+    Value: !Join [',', !GetAtt [ SimpleAD, DnsIpAddresses ]]

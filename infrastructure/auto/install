@@ -1,0 +1,9 @@
+#!/bin/bash
+set -exu -o pipefail
+PS4='+ [\t]	'
+
+apt-get update
+apt-get -y install \
+	awscli \
+	jq \
+	#

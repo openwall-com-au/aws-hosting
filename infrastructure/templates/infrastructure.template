@@ -1,0 +1,1696 @@
+# vim:set ft=yaml ts=2 sts=2 sw=2 et:
+AWSTemplateFormatVersion: 2010-09-09
+Description: 'Web Hosting: Infrastructure (meta-stack)'
+
+Parameters:
+  VpcName:
+    Description: The Name tag of the VPC (will use the name of the stack if empty)
+    Type: String
+    Default: ''
+  CidrBlock:
+    Description: The IP address range for the VPC
+    Type: String
+    MinLength: 9
+    MaxLength: 18
+    Default: 10.0.0.0/16
+    AllowedPattern: '(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})/(\d{1,2})'
+    ConstraintDescription: must be a valid IP CIDR range of the form x.x.x.x/x.
+  AvailabilityZones:
+    Description: List of Availability Zones this infrastructure will be deployed to
+    Type: CommaDelimitedList
+    Default: ''
+  AvailabilityZonesCount:
+    Description: The number of Availability Zones this infrastructure will be deployed to
+    Type: Number
+    MinValue: 1
+    Default: 2
+  KeyName:
+    Description: SSH key registered with AWS EC2
+    Type: String
+    Default: ''
+  DatabaseEngine:
+    Description: RDS Engine to use
+    Type: String
+    Default: ''
+  Encryption:
+    Description: Encryption configuration for the stack
+    Type: String
+    AllowedValues:
+      - ''
+      - builtin
+      - custom-key
+      - custom-keys
+    Default: ''
+  BastionImageId:
+    Description: AMI ID for the bastion instance
+    Type: String
+    Default: ''
+  AppImageId:
+    Description: AMI ID for the application instances
+    Type: String
+    Default: ''
+  WebImageId:
+    Description: AMI ID for the web instances
+    Type: String
+    Default: ''
+
+Mappings:
+  DatabaseConfig:
+    mysql:
+      Port: 3306
+    postgres:
+      Port: 5432
+
+Conditions:
+  useAvailabilityZones: !Not [ !Equals [ '', !Join [ '', !Ref AvailabilityZones ]]]
+  useAZ9: !Equals [ 9, !Ref AvailabilityZonesCount ]
+  useAZ8: !Or [ !Equals [ 8, !Ref AvailabilityZonesCount ], Condition: useAZ9 ]
+  useAZ7: !Or [ !Equals [ 7, !Ref AvailabilityZonesCount ], Condition: useAZ8 ]
+  useAZ6: !Or [ !Equals [ 6, !Ref AvailabilityZonesCount ], Condition: useAZ7 ]
+  useAZ5: !Or [ !Equals [ 5, !Ref AvailabilityZonesCount ], Condition: useAZ6 ]
+  useAZ4: !Or [ !Equals [ 4, !Ref AvailabilityZonesCount ], Condition: useAZ5 ]
+  useAZ3: !Or [ !Equals [ 3, !Ref AvailabilityZonesCount ], Condition: useAZ4 ]
+  useAZ2: !Or [ !Equals [ 2, !Ref AvailabilityZonesCount ], Condition: useAZ3 ]
+  useAZ1: !Or [ !Equals [ 1, !Ref AvailabilityZonesCount ], Condition: useAZ2 ]
+
+  useKeyName: !Not [ !Equals [ '', !Ref KeyName ]]
+  useEncryption: !Or [ !Not [ !Equals [ '', !Ref Encryption ]], !Equals [ 'builtin', !Ref Encryption ]]
+  useSingleCustomKey: !Equals [ 'custom-key', !Ref Encryption ]
+  useSeparateCustomKeys: !Equals [ 'custom-keys', !Ref Encryption ]
+  useDatabase: !Not [ !Equals [ '', !Ref DatabaseEngine ]]
+  useBastionImageId: !Not [ !Equals [ '', !Ref BastionImageId ]]
+  useAppImageId: !Not [ !Equals [ '', !Ref AppImageId ]]
+  useWebImageId: !Not [ !Equals [ '', !Ref WebImageId ]]
+
+Resources:
+  StackRole:
+    DependsOn: CloudFormationServiceRole
+    Type: AWS::CloudFormation::WaitConditionHandle
+
+  keyEFS:
+    Condition: useSeparateCustomKeys
+    DependsOn: StackRole
+    Type: AWS::CloudFormation::Stack
+    Properties:
+      TemplateURL: library/kms.template
+      Parameters:
+        Service: elasticfilesystem
+        KeyDescription: A key for encrypting EFS
+        EnableKeyRotation: true
+        # XXX: add SNS alerting?
+        # AlertTopic: !Ref snsKMS
+
+  keyRDS:
+    Condition: useSeparateCustomKeys
+    DependsOn: StackRole
+    Type: AWS::CloudFormation::Stack
+    Properties:
+      TemplateURL: library/kms.template
+      Parameters:
+        Service: rds
+        KeyDescription: A key for encrypting RDS
+        EnableKeyRotation: true
+        # XXX: add SNS alerting?
+        # AlertTopic: !Ref snsKMS
+
+  keyS3:
+    Condition: useSeparateCustomKeys
+    DependsOn: StackRole
+    Type: AWS::CloudFormation::Stack
+    Properties:
+      TemplateURL: library/kms.template
+      Parameters:
+        Service: s3
+        KeyDescription: A key for encrypting S3 buckets
+        EnableKeyRotation: true
+        # XXX: add SNS alerting?
+        # AlertTopic: !Ref snsKMS
+
+  keySM:
+    Condition: useSeparateCustomKeys
+    DependsOn: StackRole
+    Type: AWS::CloudFormation::Stack
+    Properties:
+      TemplateURL: library/kms.template
+      Parameters:
+        Service: secretsmanager
+        KeyDescription: A key for encrypting secrets in SecretsManager
+        EnableKeyRotation: true
+        # XXX: add SNS alerting?
+        # AlertTopic: !Ref snsKMS
+
+  keyCustom:
+    Condition: useSingleCustomKey
+    DependsOn: StackRole
+    Type: AWS::CloudFormation::Stack
+    Properties:
+      TemplateURL: library/kms.template
+      Parameters:
+        Service: ALL_SERVICES
+        KeyDescription: A custom key for encrypting resources
+        EnableKeyRotation: true
+        # XXX: add SNS alerting?
+        # AlertTopic: !Ref snsKMS
+
+  ArtifactStore:
+    DependsOn: StackRole
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    Properties:
+      AccessControl: Private
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      BucketEncryption: !If
+        - useEncryption
+        - ServerSideEncryptionConfiguration:
+            - ServerSideEncryptionByDefault:
+                KMSMasterKeyID: !If
+                  - useSeparateCustomKeys
+                  - !GetAtt [ keyS3, Outputs.KeyId ]
+                  - !If
+                    - useSingleCustomKey
+                    - !GetAtt [ keyCustom, Outputs.KeyId ]
+                    - !Ref 'AWS::NoValue'
+                SSEAlgorithm: aws:kms
+        - !Ref 'AWS::NoValue'
+      LifecycleConfiguration:
+        Rules:
+          - Prefix: ''
+            Status: Enabled
+            AbortIncompleteMultipartUpload:
+              DaysAfterInitiation: 1
+            NoncurrentVersionExpirationInDays: 6
+      VersioningConfiguration:
+        # Required for CodePipeline (XXX: is it now?)
+        Status: Enabled
+
+  Repository:
+    DependsOn: StackRole
+    Type: AWS::CodeCommit::Repository
+    Properties:
+      RepositoryName: !Sub ${AWS::StackName}
+
+  VPC:
+    DependsOn: StackRole
+    Type: AWS::CloudFormation::Stack
+    Properties:
+      TemplateURL: library/vpc.template
+      Parameters:
+        Name: !Ref VpcName
+        CidrBlock: !Ref CidrBlock
+        AvailabilityZones: !If
+          - useAvailabilityZones
+          - !Join [ ',', !Ref AvailabilityZones ]
+          - !Join [ ',', !GetAZs '' ]
+        AvailabilityZonesCount: !Ref AvailabilityZonesCount
+        EnableDnsSupport: true
+        EnableDnsHostnames: true
+      TimeoutInMinutes: 15
+
+  VpcSgDefault:
+    Type: AWS::CloudFormation::Stack
+    DependsOn: VPC
+    Properties:
+      TemplateURL: library/vpc-sg.template
+      Parameters:
+        VpcId: !GetAtt [ VPC, Outputs.VpcId ]
+      TimeoutInMinutes: 15
+
+  sgIngressNatMail:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !GetAtt [ VpcSgDefault, Outputs.nat ]
+      IpProtocol: tcp
+      FromPort: 25
+      ToPort: 25
+      CidrIp: !Ref CidrBlock
+
+  sgEgressNatMail:
+    Type: AWS::EC2::SecurityGroupEgress
+    Properties:
+      GroupId: !GetAtt [ VpcSgDefault, Outputs.nat ]
+      IpProtocol: tcp
+      FromPort: 587
+      ToPort: 587
+      CidrIp: 0.0.0.0/0
+
+  sgIngressNatHttp:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !GetAtt [ VpcSgDefault, Outputs.nat ]
+      IpProtocol: tcp
+      FromPort: 80
+      ToPort: 80
+      CidrIp: !Ref CidrBlock
+
+  sgEgressNatHttp:
+    Type: AWS::EC2::SecurityGroupEgress
+    Properties:
+      GroupId: !GetAtt [ VpcSgDefault, Outputs.nat ]
+      IpProtocol: tcp
+      FromPort: 80
+      ToPort: 80
+      CidrIp: 0.0.0.0/0
+
+  sgIngressNatHttps:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !GetAtt [ VpcSgDefault, Outputs.nat ]
+      IpProtocol: tcp
+      FromPort: 443
+      ToPort: 443
+      CidrIp: !Ref CidrBlock
+
+  sgEgressNatHttps:
+    Type: AWS::EC2::SecurityGroupEgress
+    Properties:
+      GroupId: !GetAtt [ VpcSgDefault, Outputs.nat ]
+      IpProtocol: tcp
+      FromPort: 443
+      ToPort: 443
+      CidrIp: 0.0.0.0/0
+
+  sgEgressNatSshApp:
+    Type: AWS::EC2::SecurityGroupEgress
+    Properties:
+      GroupId: !GetAtt [ VpcSgDefault, Outputs.nat ]
+      Description: Allow SSH to App instances through NAT
+      IpProtocol: tcp
+      FromPort: 22
+      ToPort: 22
+      DestinationSecurityGroupId: !Ref sgAppInstances
+
+  sgEgressNatSshWeb:
+    Type: AWS::EC2::SecurityGroupEgress
+    Properties:
+      GroupId: !GetAtt [ VpcSgDefault, Outputs.nat ]
+      Description: Allow SSH to Web instances through NAT
+      IpProtocol: tcp
+      FromPort: 22
+      ToPort: 22
+      DestinationSecurityGroupId: !Ref sgWebInstances
+
+  sgEgressNatEfs:
+    Type: AWS::EC2::SecurityGroupEgress
+    Properties:
+      GroupId: !GetAtt [ VpcSgDefault, Outputs.nat ]
+      Description: EFS
+      IpProtocol: tcp
+      FromPort: 2049
+      ToPort: 2049
+      DestinationSecurityGroupId: !Ref sgEfsMountPoint
+
+  sgAppInstances:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Application instances
+      VpcId: !GetAtt [ VPC, Outputs.VpcId ]
+      SecurityGroupEgress:
+        - Description: EFS
+          IpProtocol: tcp
+          FromPort: 2049
+          ToPort: 2049
+          DestinationSecurityGroupId: !Ref sgEfsMountPoint
+      Tags:
+        - Key: Name
+          Value: app
+
+  sgWebInstances:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Web instances
+      VpcId: !GetAtt [ VPC, Outputs.VpcId ]
+      SecurityGroupEgress:
+        - Description: EFS
+          IpProtocol: tcp
+          FromPort: 2049
+          ToPort: 2049
+          DestinationSecurityGroupId: !Ref sgEfsMountPoint
+      Tags:
+        - Key: Name
+          Value: web
+
+  sgEgressWebToAppElb:
+    Type: AWS::EC2::SecurityGroupEgress
+    Properties:
+      GroupId: !Ref sgWebInstances
+      Description: Allows Web instances to talk to App ELB
+      IpProtocol: tcp
+      FromPort: 9000
+      ToPort: 9000
+      DestinationSecurityGroupId: !Ref sgAppElb
+
+  sgAppElb:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Defines access to the internal application NLB
+      VpcId: !GetAtt [ VPC, Outputs.VpcId ]
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 9000
+          ToPort: 9000
+          SourceSecurityGroupId: !Ref sgWebInstances
+      SecurityGroupEgress:
+        - IpProtocol: tcp
+          FromPort: 9000
+          ToPort: 9000
+          DestinationSecurityGroupId: !Ref sgAppInstances
+      Tags:
+        - Key: Name
+          Value: elb/app
+
+  sgWebElb:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Defines access to the public web ALB
+      VpcId: !GetAtt [ VPC, Outputs.VpcId ]
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIpv6: ::/0
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 0.0.0.0/0
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIpv6: ::/0
+      SecurityGroupEgress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          DestinationSecurityGroupId: !Ref sgWebInstances
+      Tags:
+        - Key: Name
+          Value: elb/web
+
+  sgDatabase:
+    Condition: useDatabase
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Defines access to the RDS instance
+      VpcId: !GetAtt [ VPC, Outputs.VpcId ]
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: !FindInMap [DatabaseConfig, !Ref DatabaseEngine, Port]
+          ToPort: !FindInMap [DatabaseConfig, !Ref DatabaseEngine, Port]
+          SourceSecurityGroupId: !Ref sgAppInstances
+        - IpProtocol: tcp
+          FromPort: !FindInMap [DatabaseConfig, !Ref DatabaseEngine, Port]
+          ToPort: !FindInMap [DatabaseConfig, !Ref DatabaseEngine, Port]
+          SourceSecurityGroupId: !Ref sgWebInstances
+      SecurityGroupEgress:
+        - IpProtocol: '-1'
+          FromPort: '-1'
+          ToPort: '-1'
+          CidrIp: 127.0.0.1/32
+      Tags:
+        - Key: Name
+          Value: in/rds
+
+  sgFastCGI:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Defines access to the FastCGI interface
+      VpcId: !GetAtt [ VPC, Outputs.VpcId ]
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 9000
+          ToPort: 9000
+          SourceSecurityGroupId: !Ref sgAppElb
+      SecurityGroupEgress:
+        - IpProtocol: tcp
+          FromPort: 9000
+          ToPort: 9000
+          DestinationSecurityGroupId: !Ref sgAppElb
+      Tags:
+        - Key: Name
+          Value: fastcgi
+
+  sgOut:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Defines a set of standard outbound rules for updates
+      VpcId: !GetAtt [ VPC, Outputs.VpcId ]
+      SecurityGroupEgress:
+        - Description: HTTP
+          IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+        - Description: HTTPS
+          IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 0.0.0.0/0
+      Tags:
+        - Key: Name
+          Value: out
+
+  sgDirectoryOut:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Defines access to the directory service
+      VpcId: !GetAtt [ VPC, Outputs.VpcId ]
+      SecurityGroupEgress:
+        - Description: DNS
+          IpProtocol: tcp
+          FromPort: 53
+          ToPort: 53
+          CidrIp: !Join [ '', [ !Select [ 0, !Split [ ',', !GetAtt [ Directory, Outputs.DnsIpAddresses ]]], /32 ]]
+        - Description: DNS
+          IpProtocol: udp
+          FromPort: 53
+          ToPort: 53
+          CidrIp: !Join [ '', [ !Select [ 0, !Split [ ',', !GetAtt [ Directory, Outputs.DnsIpAddresses ]]], /32 ]]
+        - Description: Kerberos authentication
+          IpProtocol: tcp
+          FromPort: 88
+          ToPort: 88
+          CidrIp: !Join [ '', [ !Select [ 0, !Split [ ',', !GetAtt [ Directory, Outputs.DnsIpAddresses ]]], /32 ]]
+        - Description: Kerberos authentication
+          IpProtocol: udp
+          FromPort: 88
+          ToPort: 88
+          CidrIp: !Join [ '', [ !Select [ 0, !Split [ ',', !GetAtt [ Directory, Outputs.DnsIpAddresses ]]], /32 ]]
+        - Description: NTP
+          IpProtocol: udp
+          FromPort: 123
+          ToPort: 123
+          CidrIp: !Join [ '', [ !Select [ 0, !Split [ ',', !GetAtt [ Directory, Outputs.DnsIpAddresses ]]], /32 ]]
+        - Description: LDAP
+          IpProtocol: tcp
+          FromPort: 389
+          ToPort: 389
+          CidrIp: !Join [ '', [ !Select [ 0, !Split [ ',', !GetAtt [ Directory, Outputs.DnsIpAddresses ]]], /32 ]]
+        - Description: LDAP
+          IpProtocol: udp
+          FromPort: 389
+          ToPort: 389
+          CidrIp: !Join [ '', [ !Select [ 0, !Split [ ',', !GetAtt [ Directory, Outputs.DnsIpAddresses ]]], /32 ]]
+        - Description: Kerberos Password Change
+          IpProtocol: udp
+          FromPort: 464
+          ToPort: 464
+          CidrIp: !Join [ '', [ !Select [ 0, !Split [ ',', !GetAtt [ Directory, Outputs.DnsIpAddresses ]]], /32 ]]
+        - Description: Global Catalog from client to domain controller
+          IpProtocol: tcp
+          FromPort: 3268
+          ToPort: 3269
+          CidrIp: !Join [ '', [ !Select [ 0, !Split [ ',', !GetAtt [ Directory, Outputs.DnsIpAddresses ]]], /32 ]]
+        - Description: DNS
+          IpProtocol: tcp
+          FromPort: 53
+          ToPort: 53
+          CidrIp: !Join [ '', [ !Select [ 1, !Split [ ',', !GetAtt [ Directory, Outputs.DnsIpAddresses ]]], /32 ]]
+        - Description: DNS
+          IpProtocol: udp
+          FromPort: 53
+          ToPort: 53
+          CidrIp: !Join [ '', [ !Select [ 1, !Split [ ',', !GetAtt [ Directory, Outputs.DnsIpAddresses ]]], /32 ]]
+        - Description: Kerberos authentication
+          IpProtocol: tcp
+          FromPort: 88
+          ToPort: 88
+          CidrIp: !Join [ '', [ !Select [ 1, !Split [ ',', !GetAtt [ Directory, Outputs.DnsIpAddresses ]]], /32 ]]
+        - Description: Kerberos authentication
+          IpProtocol: udp
+          FromPort: 88
+          ToPort: 88
+          CidrIp: !Join [ '', [ !Select [ 1, !Split [ ',', !GetAtt [ Directory, Outputs.DnsIpAddresses ]]], /32 ]]
+        - Description: NTP
+          IpProtocol: udp
+          FromPort: 123
+          ToPort: 123
+          CidrIp: !Join [ '', [ !Select [ 1, !Split [ ',', !GetAtt [ Directory, Outputs.DnsIpAddresses ]]], /32 ]]
+        - Description: LDAP
+          IpProtocol: tcp
+          FromPort: 389
+          ToPort: 389
+          CidrIp: !Join [ '', [ !Select [ 1, !Split [ ',', !GetAtt [ Directory, Outputs.DnsIpAddresses ]]], /32 ]]
+        - Description: LDAP
+          IpProtocol: udp
+          FromPort: 389
+          ToPort: 389
+          CidrIp: !Join [ '', [ !Select [ 1, !Split [ ',', !GetAtt [ Directory, Outputs.DnsIpAddresses ]]], /32 ]]
+        - Description: Kerberos Password Change
+          IpProtocol: udp
+          FromPort: 464
+          ToPort: 464
+          CidrIp: !Join [ '', [ !Select [ 1, !Split [ ',', !GetAtt [ Directory, Outputs.DnsIpAddresses ]]], /32 ]]
+        - Description: Global Catalog from client to domain controller
+          IpProtocol: tcp
+          FromPort: 3268
+          ToPort: 3269
+          CidrIp: !Join [ '', [ !Select [ 1, !Split [ ',', !GetAtt [ Directory, Outputs.DnsIpAddresses ]]], /32 ]]
+      Tags:
+        - Key: Name
+          Value: out/directory
+
+  sgDirectoryOutSMB:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Defines access to the directory service via SMB
+      VpcId: !GetAtt [ VPC, Outputs.VpcId ]
+      SecurityGroupEgress:
+        - Description: NBT
+          IpProtocol: tcp
+          FromPort: 139
+          ToPort: 139
+          CidrIp: !Join [ '', [ !Select [ 0, !Split [ ',', !GetAtt [ Directory, Outputs.DnsIpAddresses ]]], /32 ]]
+        - Description: SMB
+          IpProtocol: tcp
+          FromPort: 445
+          ToPort: 445
+          CidrIp: !Join [ '', [ !Select [ 0, !Split [ ',', !GetAtt [ Directory, Outputs.DnsIpAddresses ]]], /32 ]]
+        - Description: NBT
+          IpProtocol: tcp
+          FromPort: 139
+          ToPort: 139
+          CidrIp: !Join [ '', [ !Select [ 1, !Split [ ',', !GetAtt [ Directory, Outputs.DnsIpAddresses ]]], /32 ]]
+        - Description: SMB
+          IpProtocol: tcp
+          FromPort: 445
+          ToPort: 445
+          CidrIp: !Join [ '', [ !Select [ 1, !Split [ ',', !GetAtt [ Directory, Outputs.DnsIpAddresses ]]], /32 ]]
+
+  sgEfsMountPoint:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Suppresses the default free for all rule
+      VpcId: !GetAtt [ VPC, Outputs.VpcId ]
+      SecurityGroupEgress:
+        - Description: Egress follows the whitelist approach
+          IpProtocol: '-1'
+          FromPort: '-1'
+          ToPort: '-1'
+          CidrIp: 127.0.0.1/32
+      Tags:
+        - Key: Name
+          Value: in/efs
+
+  sgEfsMountPointAppRule:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      Description: Allows application instances to mount EFS
+      GroupId: !Ref sgEfsMountPoint
+      IpProtocol: tcp
+      FromPort: 2049
+      ToPort: 2049
+      SourceSecurityGroupId: !Ref sgAppInstances
+
+  sgEfsMountPointWebRule:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      Description: Allows web instances to mount EFS
+      GroupId: !Ref sgEfsMountPoint
+      IpProtocol: tcp
+      FromPort: 2049
+      ToPort: 2049
+      SourceSecurityGroupId: !Ref sgWebInstances
+
+  # XXX: We are abusing Nat to do the EFS initialisation
+  sgEfsMountPointNatRule:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      Description: Allows NAT instances to mount EFS
+      GroupId: !Ref sgEfsMountPoint
+      IpProtocol: tcp
+      FromPort: 2049
+      ToPort: 2049
+      SourceSecurityGroupId: !GetAtt [ VpcSgDefault, Outputs.nat ]
+
+  efsFileSystem:
+    DependsOn: StackRole
+    Type: AWS::EFS::FileSystem
+    Properties:
+      PerformanceMode: generalPurpose
+      FileSystemTags:
+        - Key: Name
+          Value: !Sub Shared Storage for ${AWS::StackName}
+      Encrypted: !If
+        - useEncryption
+        - true
+        - false
+      KmsKeyId: !If
+        - useEncryption
+        - !If
+          - useSeparateCustomKeys
+          - !GetAtt [ keyEFS, Outputs.KeyId ]
+          - !If
+            - useSingleCustomKey
+            - !GetAtt [ keyCustom, Outputs.KeyId ]
+            - !Ref 'AWS::NoValue'
+        - !Ref 'AWS::NoValue'
+
+  efsMountTarget1:
+    Condition: useAZ1
+    Type: AWS::EFS::MountTarget
+    Properties:
+      FileSystemId: !Ref efsFileSystem
+      SubnetId: !Select [ 0, !Split [ ',', !GetAtt [ VPC, Outputs.SubnetPrivateIds ]]]
+      SecurityGroups:
+        - !Ref sgEfsMountPoint
+
+  efsMountTarget2:
+    Condition: useAZ2
+    Type: AWS::EFS::MountTarget
+    Properties:
+      FileSystemId: !Ref efsFileSystem
+      SubnetId: !Select [ 1, !Split [ ',', !GetAtt [ VPC, Outputs.SubnetPrivateIds ]]]
+      SecurityGroups:
+        - !Ref sgEfsMountPoint
+
+  efsMountTarget3:
+    Condition: useAZ3
+    Type: AWS::EFS::MountTarget
+    Properties:
+      FileSystemId: !Ref efsFileSystem
+      SubnetId: !Select [ 2, !Split [ ',', !GetAtt [ VPC, Outputs.SubnetPrivateIds ]]]
+      SecurityGroups:
+        - !Ref sgEfsMountPoint
+
+  efsMountTarget4:
+    Condition: useAZ4
+    Type: AWS::EFS::MountTarget
+    Properties:
+      FileSystemId: !Ref efsFileSystem
+      SubnetId: !Select [ 3, !Split [ ',', !GetAtt [ VPC, Outputs.SubnetPrivateIds ]]]
+      SecurityGroups:
+        - !Ref sgEfsMountPoint
+
+  efsMountTarget5:
+    Condition: useAZ5
+    Type: AWS::EFS::MountTarget
+    Properties:
+      FileSystemId: !Ref efsFileSystem
+      SubnetId: !Select [ 4, !Split [ ',', !GetAtt [ VPC, Outputs.SubnetPrivateIds ]]]
+      SecurityGroups:
+        - !Ref sgEfsMountPoint
+
+  efsMountTarget6:
+    Condition: useAZ6
+    Type: AWS::EFS::MountTarget
+    Properties:
+      FileSystemId: !Ref efsFileSystem
+      SubnetId: !Select [ 5, !Split [ ',', !GetAtt [ VPC, Outputs.SubnetPrivateIds ]]]
+      SecurityGroups:
+        - !Ref sgEfsMountPoint
+
+  efsMountTarget7:
+    Condition: useAZ7
+    Type: AWS::EFS::MountTarget
+    Properties:
+      FileSystemId: !Ref efsFileSystem
+      SubnetId: !Select [ 6, !Split [ ',', !GetAtt [ VPC, Outputs.SubnetPrivateIds ]]]
+      SecurityGroups:
+        - !Ref sgEfsMountPoint
+
+  efsMountTarget8:
+    Condition: useAZ8
+    Type: AWS::EFS::MountTarget
+    Properties:
+      FileSystemId: !Ref efsFileSystem
+      SubnetId: !Select [ 7, !Split [ ',', !GetAtt VPC.Outputs.SubnetPrivateIds ]]
+      SecurityGroups:
+        - !Ref sgEfsMountPoint
+
+  efsMountTarget9:
+    Condition: useAZ9
+    Type: AWS::EFS::MountTarget
+    Properties:
+      FileSystemId: !Ref efsFileSystem
+      SubnetId: !Select [ 8, !Split [ ',', !GetAtt VPC.Outputs.SubnetPrivateIds ]]
+      SecurityGroups:
+        - !Ref sgEfsMountPoint
+
+  PrivateZone:
+    DependsOn: StackRole
+    Type: AWS::Route53::HostedZone
+    Properties:
+      HostedZoneConfig:
+        Comment: !Sub 'An internal zone for stack ${AWS::StackName}'
+      HostedZoneTags:
+        - Key: Name
+          Value: !Sub ${AWS::StackName}.internal.
+      Name: !Sub ${AWS::StackName}.internal.
+      VPCs:
+        - VPCId: !GetAtt VPC.Outputs.VpcId
+          VPCRegion: !Ref AWS::Region
+
+  EfsRoute53Record:
+    Type: AWS::Route53::RecordSet
+    Properties:
+      HostedZoneId: !Ref PrivateZone
+      Name: !Sub efs.${AWS::StackName}.internal.
+      Type: CNAME
+      TTL: 60
+      ResourceRecords:
+        - !Sub ${efsFileSystem}.efs.${AWS::Region}.amazonaws.com.
+
+  PhpRoute53Record:
+    Type: AWS::Route53::RecordSet
+    Properties:
+      HostedZoneId: !Ref PrivateZone
+      Name: !Sub php.elb.${AWS::StackName}.internal.
+      Type: A
+      AliasTarget:
+        HostedZoneId: !GetAtt AppLoadBalancer.CanonicalHostedZoneNameID
+        DNSName: !GetAtt AppLoadBalancer.DNSName
+
+  secretDirectory:
+    DependsOn: StackRole
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: !Sub ${AWS::StackName}/SimpleAD/Administrator
+      Description: !Sub Credentials for Directory Service in the ${AWS::StackName} stack
+      KmsKeyId: !If
+        - useEncryption
+        - !If
+          - useSeparateCustomKeys
+          - !GetAtt [ keySM, Outputs.KeyId ]
+          - !If
+            - useSingleCustomKey
+            - !GetAtt [ keyCustom, Outputs.KeyId ]
+            - !Ref 'AWS::NoValue'
+        - !Ref 'AWS::NoValue'
+      GenerateSecretString:
+        SecretStringTemplate: '{"username": "Administrator"}'
+        GenerateStringKey: "password"
+        PasswordLength: 30
+      Tags:
+        - Key: Name
+          Value: directory/admin
+
+  secretDirectoryJoiner:
+    DependsOn: StackRole
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: !Sub ${AWS::StackName}/SimpleAD/Joiner
+      Description: !Sub Credentials for Directory Service in the ${AWS::StackName} stack (Joiner)
+      KmsKeyId: !If
+        - useEncryption
+        - !If
+          - useSeparateCustomKeys
+          - !GetAtt [ keySM, Outputs.KeyId ]
+          - !If
+            - useSingleCustomKey
+            - !GetAtt [ keyCustom, Outputs.KeyId ]
+            - !Ref 'AWS::NoValue'
+        - !Ref 'AWS::NoValue'
+      GenerateSecretString:
+        SecretStringTemplate: '{"username": "Joiner"}'
+        GenerateStringKey: "password"
+        ExcludeCharacters: "\"!$'{}|`\\"
+        PasswordLength: 30
+      Tags:
+        - Key: Name
+          Value: directory/joiner
+
+  Directory:
+    Condition: useAZ2
+    DependsOn: StackRole
+    Type: AWS::CloudFormation::Stack
+    Properties:
+      TemplateURL: library/simple-ad.template
+      Parameters:
+        Name: !Sub id.${AWS::StackName}.internal # trailing dor is not allowed
+        Description: This directory holds all hosting accounts and active EC2 instances
+        ShortName: ID
+        Size: Small
+        Password: !Sub 'resolve:secretsmanager:${secretDirectory}:SecretString:password'
+        SubnetIds: !Join
+          - ','
+          - - !Select [ 0, !Split [ ',', !GetAtt [ VPC, Outputs.SubnetPrivateIds ]]]
+            - !Select [ 1, !Split [ ',', !GetAtt [ VPC, Outputs.SubnetPrivateIds ]]]
+        VpcId: !GetAtt [ VPC, Outputs.VpcId ]
+      TimeoutInMinutes: 15
+
+  DhcpOptions:
+    Type: AWS::EC2::DHCPOptions
+    Properties:
+      DomainName: !Sub ${AWS::StackName}.internal.
+      DomainNameServers: !Split [ ',', !GetAtt [ Directory, Outputs.DnsIpAddresses ]]
+
+  DhcpOptionsAssociation:
+    Type: AWS::EC2::VPCDHCPOptionsAssociation
+    Properties:
+      DhcpOptionsId: !Ref DhcpOptions
+      VpcId: !GetAtt [ VPC, Outputs.VpcId ]
+
+  S3Endpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      PolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal: '*'
+            Action:
+              - s3:*
+            Resource:
+              - !Sub 'arn:aws:s3:::cloudformation-custom-resource-response-${AWS::Region}/*'
+              - !Sub 'arn:aws:s3:::cloudformation-waitcondition-${AWS::Region}/*'
+              - !Sub 'arn:aws:s3:::${ArtifactStore}/*'
+      RouteTableIds: [ !GetAtt [ VPC, Outputs.RouteTablePrivateId ]]
+      ServiceName: !Sub 'com.amazonaws.${AWS::Region}.s3'
+      VpcId: !GetAtt [ VPC, Outputs.VpcId ]
+
+  secretRDS:
+    Condition: useDatabase
+    DependsOn: StackRole
+    Type: "AWS::SecretsManager::Secret"
+    Properties:
+      Name: !Sub ${AWS::StackName}/RDS/master
+      Description: !Sub Credentials for the RDS Service in the ${AWS::StackName} stack
+      KmsKeyId: !If
+        - useEncryption
+        - !If
+          - useSeparateCustomKeys
+          - !GetAtt [ keySM, Outputs.KeyId ]
+          - !If
+            - useSingleCustomKey
+            - !GetAtt [ keyCustom, Outputs.KeyId ]
+            - !Ref 'AWS::NoValue'
+        - !Ref 'AWS::NoValue'
+      GenerateSecretString:
+        SecretStringTemplate: '{"username": "master"}'
+        GenerateStringKey: "password"
+        PasswordLength: 30
+        ExcludeCharacters: '"@/\'
+      Tags:
+        - Key: Name
+          Value: database
+
+  RDS:
+    Condition: useDatabase
+    Type: AWS::CloudFormation::Stack
+    Properties:
+      TemplateURL: library/rds.template
+      Parameters:
+        AllocatedStorage: 20 # XXX: need to parametrise
+        DBInstanceClass: db.t2.medium
+        DBInstanceIdentifier: !Sub ${AWS::StackName}
+        Engine: !Ref DatabaseEngine
+        MasterUsername: !Sub '{{resolve:secretsmanager:${secretRDS}:SecretString:username}}'
+        MasterUserPassword: !Sub 'resolve:secretsmanager:${secretRDS}:SecretString:password'
+        MultiAZ: False
+        SubnetIds: !GetAtt [ VPC, Outputs.SubnetPrivateIds ]
+        VPCSecurityGroups: !Join [ ',', [ !Ref sgDatabase ]]
+        KmsKeyId: !If
+          - useEncryption
+          - !If
+            - useSeparateCustomKeys
+            - !GetAtt [ keyRDS, Outputs.KeyId ]
+            - !If
+              - useSingleCustomKey
+              - !GetAtt [ keyCustom, Outputs.KeyId ]
+              - !Ref 'AWS::NoValue'
+          - !Ref 'AWS::NoValue'
+      TimeoutInMinutes: 60
+
+  secretRDSInstanceAttachment:
+    Condition: useDatabase
+    Type: AWS::SecretsManager::SecretTargetAttachment
+    Properties:
+      SecretId: !Ref secretRDS
+      TargetId: !GetAtt [ RDS, Outputs.RdsId ]
+      TargetType: AWS::RDS::DBInstance
+
+  WebLoadBalancer:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Type: application
+      IpAddressType: ipv4
+      LoadBalancerAttributes:
+        - Key: access_logs.s3.enabled
+          Value: False
+        - Key: deletion_protection.enabled
+          Value: False
+        - Key: idle_timeout.timeout_seconds
+          Value: 60
+        - Key: routing.http2.enabled
+          Value: True
+      Scheme: internet-facing
+      SecurityGroups:
+        - !Ref sgWebElb
+      Subnets: !Split [ ',', !GetAtt [ VPC, Outputs.SubnetPublicIds ]]
+      Tags:
+        - Key: Name
+          Value: web
+
+  WebLoadBalancerListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      DefaultActions:
+        - TargetGroupArn: !Ref WebTargetGroup
+          Type: forward
+      LoadBalancerArn: !Ref WebLoadBalancer
+      Port: 80
+      Protocol: HTTP
+
+  WebTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Port: 80
+      Protocol: HTTP
+      HealthCheckPath: /healthcheck
+      HealthCheckIntervalSeconds: 6
+      HealthCheckTimeoutSeconds: 3
+      HealthyThresholdCount: 3
+      UnhealthyThresholdCount: 2
+      TargetGroupAttributes:
+        - Key: deregistration_delay.timeout_seconds
+          Value: 120
+        - Key: slow_start.duration_seconds
+          Value: 60
+      VpcId: !GetAtt [ VPC, Outputs.VpcId ]
+
+  WebLaunchTemplate:
+    Condition: useWebImageId
+    Type: "AWS::EC2::LaunchTemplate"
+    Properties:
+      LaunchTemplateData:
+        InstanceType: t3.micro
+#       TagSpecifications:
+#         - TagSpecification
+        ImageId: !Ref WebImageId
+        KeyName: !If
+          - useKeyName
+          - !Ref KeyName
+          - !Ref AWS::NoValue
+        UserData:
+          Fn::Base64: !Sub |
+            PHP_PORT=9000
+        BlockDeviceMappings:
+          - DeviceName: /dev/sdc
+            Ebs:
+              DeleteOnTermination: True
+              VolumeSize: 100
+              VolumeType: gp2
+              Encrypted: !If
+                - useEncryption
+                - true
+                - !Ref 'AWS::NoValue'
+        SecurityGroupIds:
+          - !Ref sgWebInstances
+          - !Ref sgDirectoryOut
+          - !GetAtt [ VpcSgDefault, Outputs.http ]
+          - !GetAtt [ VpcSgDefault, Outputs.ssh ]
+
+  WebAsg:
+    Condition: useWebImageId
+    DependsOn: NAT
+    Type: AWS::AutoScaling::AutoScalingGroup
+    Properties:
+      VPCZoneIdentifier: !Split [ ',', !GetAtt [ VPC, Outputs.SubnetPrivateIds ]]
+      Cooldown: 1800
+      HealthCheckGracePeriod: 90
+#     HealthCheckType: ELB
+      HealthCheckType: EC2
+      LaunchTemplate:
+        LaunchTemplateId: !Ref WebLaunchTemplate
+        Version: !GetAtt WebLaunchTemplate.LatestVersionNumber
+      DesiredCapacity: 1
+      MinSize: 0
+      MaxSize: 2
+      TargetGroupARNs:
+        - !Ref WebTargetGroup
+      Tags:
+        - Key: Name
+          Value: !Sub ${AWS::StackName}/web
+          PropagateAtLaunch: True
+    UpdatePolicy:
+      AutoScalingRollingUpdate:
+       MinInstancesInService: "1"
+       MaxBatchSize: "1"
+       PauseTime: "PT2M5S"
+#      WaitOnResourceSignals: "true"
+
+  AppLoadBalancer:
+    Type: AWS::ElasticLoadBalancing::LoadBalancer
+    Properties:
+      ConnectionDrainingPolicy:
+        Enabled: True
+        Timeout: 120
+      ConnectionSettings:
+        IdleTimeout: 60
+      CrossZone: False
+      HealthCheck:
+        Interval: 6
+        Target: TCP:9000
+        Timeout: 3
+        HealthyThreshold: 3
+        UnhealthyThreshold: 2
+      Listeners:
+        - LoadBalancerPort: 9000
+          Protocol: TCP
+          InstancePort: 9000
+      Scheme: internal
+      SecurityGroups:
+        - !Ref sgAppElb
+      Subnets: !Split [ ',', !GetAtt [ VPC, Outputs.SubnetPrivateIds ]]
+      Tags:
+        - Key: Name
+          Value: app
+
+  AppLaunchTemplate:
+    Condition: useAppImageId
+    Type: "AWS::EC2::LaunchTemplate"
+    Properties:
+      LaunchTemplateData:
+        InstanceType: t3.micro
+#       TagSpecifications:
+#         - TagSpecification
+        ImageId: !Ref AppImageId
+        KeyName: !If
+          - useKeyName
+          - !Ref KeyName
+          - !Ref AWS::NoValue
+        UserData:
+          Fn::Base64: !Sub |
+            PHP_FPM_LB_PORT=9000
+        BlockDeviceMappings:
+          - DeviceName: /dev/sdc
+            Ebs:
+              DeleteOnTermination: True
+              VolumeSize: 100
+              VolumeType: gp2
+        SecurityGroupIds:
+          - !Ref sgAppInstances
+          - !Ref sgFastCGI
+          - !Ref sgDirectoryOut
+          - !GetAtt [ VpcSgDefault, Outputs.ssh ]
+
+  AppAsg:
+    Condition: useAppImageId
+    DependsOn: NAT
+    Type: AWS::AutoScaling::AutoScalingGroup
+    Properties:
+      VPCZoneIdentifier: !Split [ ',', !GetAtt [ VPC, Outputs.SubnetPrivateIds ]]
+      Cooldown: 1800
+      HealthCheckGracePeriod: 240
+#     HealthCheckType: ELB
+      HealthCheckType: EC2
+      LaunchTemplate:
+        LaunchTemplateId: !Ref AppLaunchTemplate
+        Version: !GetAtt AppLaunchTemplate.LatestVersionNumber
+      DesiredCapacity: 1
+      MinSize: 0
+      MaxSize: 2
+      LoadBalancerNames:
+        - !Ref AppLoadBalancer
+      Tags:
+        - Key: Name
+          Value: !Sub ${AWS::StackName}/app
+          PropagateAtLaunch: True
+    UpdatePolicy:
+      AutoScalingRollingUpdate:
+       MinInstancesInService: "1"
+       MaxBatchSize: "1"
+       PauseTime: "PT3M"
+#      WaitOnResourceSignals: "true"
+
+  Bastion:
+    Condition: useBastionImageId
+    Type: AWS::CloudFormation::Stack
+    Properties:
+      TemplateURL: library/bastion.template
+      Parameters:
+        ImageId: !Ref BastionImageId
+        InstanceType: t3.nano
+        KeyName: !Ref KeyName
+        SecurityGroupIds: !Join
+          - ','
+          - - !GetAtt VpcSgDefault.Outputs.nat
+            - !GetAtt VpcSgDefault.Outputs.ssh
+            - !Ref sgDirectoryOut
+        SubnetPublicIds: !GetAtt VPC.Outputs.SubnetPublicIds
+      TimeoutInMinutes: 15
+
+  NAT:
+    Type: AWS::EC2::NatGateway
+    Properties:
+      AllocationId: !GetAtt EIP.AllocationId
+      SubnetId: !Select [ 0, !Split [ ',', !GetAtt [ VPC, Outputs.SubnetPublicIds ]]]
+      Tags:
+        - Key: Name
+          Value: nat
+
+  EIP:
+    Type: AWS::EC2::EIP
+    Properties:
+      Domain: vpc
+
+  DefaultRoute:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !GetAtt [ VPC, Outputs.RouteTablePrivateId ]
+      DestinationCidrBlock: 0.0.0.0/0
+      NatGatewayId:
+        Ref: NAT
+
+  CD:
+    # We are abusing this resource for bootstrapping purposes
+    Type: AWS::CloudFormation::Stack
+    Properties:
+      TemplateURL: ci-cd.template
+      Parameters:
+        RepositoryName: !GetAtt Repository.Name
+        # NOTE: Do not remove the following line since it is used as an
+        #       anchor for the bootstrapping script to inject few
+        #       parameters required for the bootstrap, namely:
+        #
+        #           PrivilegedMode: true
+        #           BuildSpec: bootstrap/buildspec.yml
+        #           BranchName: master
+        BranchName: infrastructure
+        ArtifactStore: !Ref ArtifactStore
+        ParentStackName: !Ref AWS::StackName
+        CloudFormationServiceRoleArn: !GetAtt CloudFormationServiceRole.Arn
+        CodeBuildEnvironment: !Join
+          - ','
+          - - !Sub SECRET_AD_ARN=${secretDirectory}
+            - !Sub SECRET_AD_JOIN_ARN=${secretDirectoryJoiner}
+            - !Sub SECRET_RDS_ARN=${secretRDS}
+            - !Sub AD_DOMAIN=${Directory.Outputs.Name}
+            - !Sub EFS_DNS=${EfsRoute53Record}
+            - !Sub EFS_ID=${efsFileSystem}
+            - !Sub PHP_DNS=${PhpRoute53Record}
+        CodeBuildRoleArn: !GetAtt CodeBuildRole.Arn
+        VpcId: !GetAtt [ VPC, Outputs.VpcId ]
+        Subnets: !GetAtt [ VPC, Outputs.SubnetPrivateIds ]
+        SecurityGroupIds: !Join
+          - ','
+          - - !Ref sgAppInstances
+            - !Ref sgDirectoryOut
+            - !Ref sgDirectoryOutSMB
+            - !Ref sgOut
+        EncryptionKey: !If
+          - useEncryption
+          - !If
+            - useSeparateCustomKeys
+            - !GetAtt [ keyS3, Outputs.KeyId ]
+            - !If
+              - useSingleCustomKey
+              - !GetAtt [ keyCustom, Outputs.KeyId ]
+              - !Ref 'AWS::NoValue'
+          - !Ref 'AWS::NoValue'
+
+  AmiCreator:
+    DependsOn: CD
+    Type: AWS::CloudFormation::Stack
+    Properties:
+      TemplateURL: ami-creator.template
+      Parameters:
+        RepositoryName: !GetAtt Repository.Name
+        BranchName: images
+        ArtifactStore: !Ref ArtifactStore
+        ParentStackName: !Ref AWS::StackName
+        ParentStackRoleArn: !GetAtt CloudFormationServiceRole.Arn
+        CodeBuildEnvironment: !Join
+          - ','
+          - - !Sub SECRET_AD_JOIN_ARN=${secretDirectoryJoiner}
+            - !Sub SECRET_RDS_ARN=${secretRDS}
+            - !Sub AD_DOMAIN=${Directory.Outputs.Name}
+            - !Sub EFS_DNS=${EfsRoute53Record}
+            - !Sub EFS_ID=${efsFileSystem}
+            - !Sub PHP_DNS=${PhpRoute53Record}
+            - !Sub PHP_PORT=9000
+        EncryptionKey: !If
+          - useEncryption
+          - !If
+            - useSeparateCustomKeys
+            - !GetAtt [ keyS3, Outputs.KeyId ]
+            - !If
+              - useSingleCustomKey
+              - !GetAtt [ keyCustom, Outputs.KeyId ]
+              - !Ref 'AWS::NoValue'
+          - !Ref 'AWS::NoValue'
+        AvailabilityZones: !If
+          - useAvailabilityZones
+          - !Join [ ',', !Ref AvailabilityZones ]
+          - !Join [ ',', !GetAZs '' ]
+        AvailabilityZonesCount: !Ref AvailabilityZonesCount
+
+  CodeBuildRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Action:
+              - sts:AssumeRole
+            Principal:
+              Service:
+                - codebuild.amazonaws.com
+            Effect: Allow
+      Path: /
+      Policies:
+        - PolicyName: CodeBuild
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Action:
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource:
+                  # Need to think of something here since it is too generic and can bite us (maybe we need to use the ProjectName)
+                  - !Sub arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/codebuild/CodeBuild-*
+                  - !Sub arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/codebuild/CodeBuild-*:*
+                Effect: Allow
+              - Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                Resource:
+                  - !Sub arn:aws:s3:::${ArtifactStore}/${AWS::StackName}-*
+                  - !Sub arn:aws:s3:::${ArtifactStore}/cloudformation/*
+                Effect: Allow
+              - Action:
+                  - cloudformation:DescribeStacks
+                Resource:
+                  - !Sub arn:aws:cloudformation:${AWS::Region}:${AWS::AccountId}:stack/${AWS::StackName}/*
+                  - !Sub arn:aws:cloudformation:${AWS::Region}:${AWS::AccountId}:stack/${AWS::StackName}-/*
+                Effect: Allow
+              - Action:
+                  - cloudformation:GetTemplate
+                Resource:
+                  - !Sub arn:aws:cloudformation:${AWS::Region}:${AWS::AccountId}:stack/${AWS::StackName}/*
+                Effect: Allow
+              - Action: # VPC support requires this
+                  - ec2:DescribeVpcs
+                  - ec2:DescribeDhcpOptions
+                  - ec2:DescribeSubnets
+                  - ec2:DescribeSecurityGroups
+                  - ec2:DescribeNetworkInterfaces
+                  - ec2:CreateNetworkInterface
+                  - ec2:DeleteNetworkInterface
+                Resource:
+                  - '*'
+                Effect: Allow
+              - Action: # VPC support requires this
+                  - ec2:CreateNetworkInterfacePermission
+                Resource:
+                  - !Sub arn:aws:ec2:${AWS::Region}:${AWS::AccountId}:network-interface/*
+                Condition:
+                  StringEquals:
+                    ec2:AuthorizedService: codebuild.amazonaws.com
+                    ec2:Subnet:
+                      - !Join
+                        - ''
+                        - - !Sub arn:aws:ec2:${AWS::Region}:${AWS::AccountId}:subnet/
+                          - !Select [ 0, !Split [',', !GetAtt [ VPC, Outputs.SubnetPrivateIds ]]]
+                      - !If
+                        - useAZ2
+                        - !Join
+                          - ''
+                          - - !Sub arn:aws:ec2:${AWS::Region}:${AWS::AccountId}:subnet/
+                            - !Select [ 1, !Split [',', !GetAtt [ VPC, Outputs.SubnetPrivateIds ]]]
+                        - !Ref 'AWS::NoValue'
+                      - !If
+                        - useAZ3
+                        - !Join
+                          - ''
+                          - - !Sub arn:aws:ec2:${AWS::Region}:${AWS::AccountId}:subnet/
+                            - !Select [ 2, !Split [',', !GetAtt [ VPC, Outputs.SubnetPrivateIds ]]]
+                        - !Ref 'AWS::NoValue'
+                      - !If
+                        - useAZ4
+                        - !Join
+                          - ''
+                          - - !Sub arn:aws:ec2:${AWS::Region}:${AWS::AccountId}:subnet/
+                            - !Select [ 3, !Split [',', !GetAtt [ VPC, Outputs.SubnetPrivateIds ]]]
+                        - !Ref 'AWS::NoValue'
+                      - !If
+                        - useAZ5
+                        - !Join
+                          - ''
+                          - - !Sub arn:aws:ec2:${AWS::Region}:${AWS::AccountId}:subnet/
+                            - !Select [ 4, !Split [',', !GetAtt [ VPC, Outputs.SubnetPrivateIds ]]]
+                        - !Ref 'AWS::NoValue'
+                      - !If
+                        - useAZ6
+                        - !Join
+                          - ''
+                          - - !Sub arn:aws:ec2:${AWS::Region}:${AWS::AccountId}:subnet/
+                            - !Select [ 5, !Split [',', !GetAtt [ VPC, Outputs.SubnetPrivateIds ]]]
+                        - !Ref 'AWS::NoValue'
+                      - !If
+                        - useAZ7
+                        - !Join
+                          - ''
+                          - - !Sub arn:aws:ec2:${AWS::Region}:${AWS::AccountId}:subnet/
+                            - !Select [ 6, !Split [',', !GetAtt [ VPC, Outputs.SubnetPrivateIds ]]]
+                        - !Ref 'AWS::NoValue'
+                      - !If
+                        - useAZ8
+                        - !Join
+                          - ''
+                          - - !Sub arn:aws:ec2:${AWS::Region}:${AWS::AccountId}:subnet/
+                            - !Select [ 7, !Split [',', !GetAtt [ VPC, Outputs.SubnetPrivateIds ]]]
+                        - !Ref 'AWS::NoValue'
+                      - !If
+                        - useAZ9
+                        - !Join
+                          - ''
+                          - - !Sub arn:aws:ec2:${AWS::Region}:${AWS::AccountId}:subnet/
+                            - !Select [ 8, !Split [',', !GetAtt [ VPC, Outputs.SubnetPrivateIds ]]]
+                        - !Ref 'AWS::NoValue'
+                Effect: Allow
+              - Action:
+                  - secretsmanager:GetSecretValue
+                Resource:
+                  - !Ref secretDirectory
+                  - !Ref secretDirectoryJoiner
+                  - !Ref secretRDS
+                Effect: Allow
+              - Action:
+                  - elasticfilesystem:DescribeTags
+                  - elasticfilesystem:CreateTags
+                  - elasticfilesystem:DeleteTags
+                Resource:
+                  - !Sub arn:aws:elasticfilesystem:${AWS::Region}:${AWS::AccountId}:file-system/${efsFileSystem}
+                Effect: Allow
+
+  CloudFormationServiceRole:
+    # This role is a tricky one since we can't have any direct references to
+    # reources due to this role being bound to the stack.
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Action:
+              - sts:AssumeRole
+            Principal:
+              Service:
+                - cloudformation.amazonaws.com
+            Effect: Allow
+      Path: /
+      Policies:
+        - PolicyName: CloudFormation
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Action:
+                  - cloudformation:*
+                Resource:
+                  - !Sub arn:aws:cloudformation:${AWS::Region}:${AWS::AccountId}:*
+                Effect: Allow
+              - Action:
+                  - iam:GetRole
+                  - iam:CreateRole
+                  - iam:DeleteRole
+                  - iam:GetRolePolicy
+                  - iam:PutRolePolicy
+                  - iam:DeleteRolePolicy
+                  - iam:AttachRolePolicy
+                  - iam:DetachRolePolicy
+                Resource:
+                  - !Sub arn:aws:iam::${AWS::AccountId}:role/*
+                Effect: Allow
+              - Action:
+                  - iam:PassRole
+                Resource:
+                  - !Sub arn:aws:iam::${AWS::AccountId}:role/${AWS::StackName}-*
+                Effect: Allow
+              - Action:
+                  - codepipeline:GetPipeline
+                  - codepipeline:CreatePipeline
+                  - codepipeline:UpdatePipeline
+                  - codepipeline:DeletePipeline
+                  - codepipeline:GetPipelineState
+                Resource:
+                  - !Sub arn:aws:codepipeline:${AWS::Region}:${AWS::AccountId}:${AWS::StackName}-*
+                Effect: Allow
+              - Action:
+                  - codebuild:CreateProject
+                  - codebuild:UpdateProject
+                  - codebuild:DeleteProject
+                  - codebuild:BatchGetProjects
+                Resource:
+                  - !Sub arn:aws:codebuild:${AWS::Region}:${AWS::AccountId}:project/*
+                Effect: Allow
+              - Action:
+                  - s3:*
+                Resource:
+                  - !Sub arn:aws:s3:::${AWS::StackName}-*
+                Effect: Allow
+              - Action:
+                  - logs:CreateLogGroup
+                  - logs:DeleteLogGroup
+                  - logs:CreateLogStream
+                  - logs:DeleteLogStream
+                  - logs:PutLogEvents
+                  - logs:PutMetricFilter
+                  - logs:DeleteMetricFilter
+                  - logs:PutRetentionPolicy
+                  - logs:DeleteRetentionPolicy
+                Resource:
+                  - !Sub arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/codebuild/*
+                  - !Sub arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/${AWS::StackName}-*
+                  - !Sub arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:${AWS::StackName}/*
+                Effect: Allow
+              - Action:
+                - ssm:GetParameter
+                - ssm:PutParameter
+                - ssm:DeleteParameter
+                Resource:
+                  - !Sub arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/${AWS::StackName}/*
+                  - !Sub arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/aws/reference/secretsmanager/${AWS::StackName}/*
+                Effect: Allow
+              - Action:
+                  - secretsmanager:GetSecretValue
+                  - secretsmanager:PutSecretValue
+                  - secretsmanager:TagResource
+                  - secretsmanager:UntagResource
+                  - secretsmanager:DescribeSecret
+                  - secretsmanager:UpdateSecret
+                  - secretsmanager:DeleteSecret
+                  - secretsmanager:GetResourcePolicy
+                  - secretsmanager:PutResourcePolicy
+                  - secretsmanager:UpdateSecretVersionStage
+                Resource:
+                  #- !Ref secretDirectory
+                  #- !Ref secretDirectoryJoiner
+                  #- !Ref secretRDS
+                  - !Sub arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:${AWS::StackName}/*
+                Effect: Allow
+              - Action:
+                  - elasticfilesystem:CreateTags
+                  - elasticfilesystem:DeleteTags
+                  - elasticfilesystem:DescribeTags
+                  - elasticfilesystem:CreateMountTarget
+                  - elasticfilesystem:DeleteMountTarget
+                  - elasticfilesystem:DeleteFileSystem
+                  - elasticfilesystem:DescribeFileSystems
+                Resource:
+                  #- !Sub arn:aws:elasticfilesystem:${AWS::Region}:${AWS::AccountId}:file-system/${efsFileSystem}
+                  - !Sub arn:aws:elasticfilesystem:${AWS::Region}:${AWS::AccountId}:file-system/fs-*
+                  # XXX: Need to introduce a condition based on a tag
+                Effect: Allow
+              - Action:
+                  - events:DescribeRule
+                  - events:PutRule
+                  - events:DeleteRule
+                  - events:ListRules
+                  - events:PutTargets
+                  - events:RemoveTargets
+                  - events:ListTargetsByRule
+                Resource:
+                  - !Sub arn:aws:events:${AWS::Region}:${AWS::AccountId}:rule/${AWS::StackName}-*
+                Effect: Allow
+              - Action:
+                  - route53:ListQueryLoggingConfigs
+                Resource:
+                  #- !Sub arn:aws:route53:::hostedzone/${PrivateZone}
+                  - !Sub arn:aws:route53:::hostedzone/*
+                  # XXX: needs a condition to confine this
+                Effect: Allow
+              - Action:
+                  - ec2:DescribeAccountAttributes
+                  - ec2:DescribeAvailabilityZones
+                  - ec2:DescribeSubnets
+                  - ec2:DescribeNetworkAcls
+                  - ec2:CreateVpc # VPC
+                  - ec2:DeleteVpc
+                  - ec2:DescribeVpcs
+                  - ec2:DescribeVpcAttribute
+                  - ec2:ModifyVpcAttribute
+                  - ec2:CreateInternetGateway # VPC stack
+                  - ec2:DeleteInternetGateway # VPC stack (arn:aws:ec2:$region:$account:internet-gateway/igw-id)
+                  - ec2:AttachInternetGateway # VPC stack
+                  - ec2:DescribeInternetGateways # VPC stack
+                  - ec2:DetachInternetGateway # VPC stack
+                  - ec2:DeleteRouteTable # VPC stack (arn:aws:ec2:$region:$account:route-table/$route-table-id)
+                  - ec2:AssociateRouteTable
+                  - ec2:CreateRouteTable
+                  - ec2:DescribeRouteTables
+                  - ec2:DisassociateRouteTable
+                  - ec2:ReplaceRouteTableAssociation
+                  - ec2:CreateRoute
+                  - ec2:DeleteRoute # VPC (arn:aws:ec2:$region:$account:route-table/$route-table-id)
+                  - ec2:ReplaceRoute
+                  - ec2:CreateSubnet
+                  - ec2:DeleteSubnet
+                  - ec2:DescribeSubnets
+                  - ec2:ModifySubnetAttribute
+                  - ec2:CreateTags # VPC (multiple resources)
+                  - ec2:DeleteTags # VPC (multiple resources)
+                  - ec2:DescribeTags
+                  - ec2:AuthorizeSecurityGroupEgress # VPC-SG
+                  - ec2:AuthorizeSecurityGroupIngress # VPC-SG
+                  - ec2:DeleteSecurityGroup # VPC-SG
+                  - ec2:RevokeSecurityGroupEgress # VPC-SG
+                  - ec2:RevokeSecurityGroupIngress # VPC-SG
+                  - ec2:CreateSecurityGroup # VPC-SG
+                  - ec2:DescribeSecurityGroups # VPC, VPC-SG
+                  - ds:CreateDirectory # Simple-AD
+                  - ds:DeleteDirectory # Simple-AD
+                  - ds:DescribeDirectories # Simple-AD
+                  - rds:DescribeDBInstances # RDS
+                  - rds:CreateDBInstance # RDS
+                  - rds:CreateDBInstanceReadReplica
+                  - rds:CreateDBParameterGroup
+                  - rds:CreateDBSecurityGroup
+                  - rds:CreateDBSnapshot
+                  - rds:CreateDBSubnetGroup
+                  - rds:CreateOptionGroup
+                  - rds:DeleteDBInstance
+                  - rds:DeleteDBParameterGroup
+                  - rds:DeleteDBSecurityGroup
+                  - rds:DeleteDBSnapshot
+                  - rds:DeleteDBSubnetGroup
+                  - rds:DeleteOptionGroup
+                  - rds:DescribeDBParameterGroups
+                  - rds:DescribeDBParameters
+                  - rds:DescribeDBSecurityGroups
+                  - rds:DescribeDBSnapshots
+                  - rds:DescribeDBSubnetGroups
+                  - rds:DescribeEngineDefaultParameters
+                  - rds:DescribeOptionGroups
+                  - rds:DescribeOptionGroupOptions
+                  - rds:ModifyDBInstance
+                  - rds:ModifyDBParameterGroup
+                  - rds:ModifyDBSubnetGroup
+                  - rds:ModifyOptionGroup
+                  - logs:DescribeLogGroups
+                  - elasticfilesystem:CreateFileSystem
+                  - elasticloadbalancing:AddTags # LB (arn:aws:elasticloadbalancing:$region:$account:loadbalancer/$load-balancer-name ?)
+                  - elasticloadbalancing:RemoveTags
+                  - elasticloadbalancing:DescribeTags
+                  - elasticloadbalancing:CreateListener
+                  - elasticloadbalancing:DeleteListener
+                  - elasticloadbalancing:DescribeListeners
+                  - elasticloadbalancing:ModifyListener
+                  - elasticloadbalancing:CreateLoadBalancer
+                  - elasticloadbalancing:DeleteLoadBalancer
+                  - elasticloadbalancing:DescribeLoadBalancerAttributes
+                  - elasticloadbalancing:ModifyLoadBalancerAttributes
+                  - elasticloadbalancing:DescribeLoadBalancers
+                  - elasticloadbalancing:CreateRule
+                  - elasticloadbalancing:DeleteRule
+                  - elasticloadbalancing:DescribeRules
+                  - elasticloadbalancing:ModifyRule
+                  - elasticloadbalancing:SetRulePriorities
+                  - elasticloadbalancing:CreateTargetGroup # LB (arn:aws:elasticloadbalancing:${AWS::Region}:${AWS::AccountId}:targetgroup/$WebTargetGroup/* ?)
+                  - elasticloadbalancing:DeleteTargetGroup
+                  - elasticloadbalancing:DescribeTargetGroups
+                  - elasticloadbalancing:DescribeTargetGroupAttributes
+                  - elasticloadbalancing:ModifyTargetGroup
+                  - elasticloadbalancing:ModifyTargetGroupAttributes
+                  - elasticloadbalancing:RegisterTargets
+                  - elasticloadbalancing:DeregisterTargets
+                  - elasticloadbalancing:DescribeTargetHealth
+                  - elasticloadbalancing:DescribeSSLPolicies
+                  - elasticloadbalancing:SetSecurityGroups
+                  - elasticloadbalancing:SetSubnets
+                  - codecommit:ListRepositories
+                  - codecommit:CreateRepository # arn:aws:codecommit:$region:$account:$repository-name
+                  - codecommit:DeleteRepository # same
+                  - codecommit:GetRepository
+                  - ec2:DescribeImages # AMI
+                  - ec2:* # finding culprit for WebLaunchTemplate stack
+                  - autoscaling:DescribeScalingActivities
+                  - autoscaling:DescribeAutoScalingGroups
+                  - autoscaling:CreateAutoScalingGroup
+                  - autoscaling:UpdateAutoScalingGroup
+                  - autoscaling:DeleteAutoScalingGroup
+                  - autoscaling:DescribeLifecycleHookTypes
+                  - autoscaling:PutLifecycleHook
+                  - autoscaling:DeleteLifecycleHook
+                  - autoscaling:TerminateInstanceInAutoScalingGroup
+                  - autoscaling:SuspendProcesses
+                  - autoscaling:ResumeProcesses
+                  - autoscaling:DescribeScheduledActions
+                  - autoscaling:PutScheduledUpdateGroupAction
+                  - autoscaling:SetDesiredCapacity
+                  - autoscaling:DescribeLaunchConfigurations
+                  - autoscaling:CreateLaunchConfiguration
+                  - autoscaling:DeleteLaunchConfiguration
+                  - autoscaling:DescribeLoadBalancers
+                  - autoscaling:AttachLoadBalancers
+                  - autoscaling:DetachLoadBalancers
+                  - autoscaling:DescribeLoadBalancerTargetGroups
+                  - autoscaling:AttachLoadBalancerTargetGroups
+                  - autoscaling:DetachLoadBalancerTargetGroups
+                  - autoscaling:CreateOrUpdateTags
+                  - autoscaling:DeleteTags
+                  - route53:GetHostedZone
+                  - route53:GetChange
+                  - route53:AssociateVPCWithHostedZone
+                  - route53:DisassociateVPCFromHostedZone
+                  - route53:ChangeResourceRecordSets
+                  - route53:CreateHostedZone
+                  - route53:DeleteHostedZone
+#                 - route53:GetQueryLoggingConfig
+#                 - route53:CreateQueryLoggingConfig
+#                 - route53:DeleteQueryLoggingConfig
+                  - route53:UpdateHostedZoneComment
+                  - lambda:GetFunctionConfiguration
+                  - lambda:UpdateFunctionConfiguration
+                  - lambda:AddPermission
+                  - lambda:RemovePermission
+                  - lambda:CreateFunction
+                  - lambda:DeleteFunction
+                  - lambda:InvokeFunction
+                  - lambda:UpdateFunctionCode
+                  - ec2:ModifyInstanceAttribute # NAT
+                  - autoscaling:SetInstanceHealth
+                  - cloudformation:SignalResource
+                  - autoscaling:DeleteScheduledAction
+                  - autoscaling:PutScalingPolicy
+                  - autoscaling:DescribeAutoScalingInstances
+                  - iam:GetInstanceProfile
+                  - iam:CreateInstanceProfile
+                  - iam:DeleteInstanceProfile
+                  - iam:AddRoleToInstanceProfile
+                  - iam:RemoveRoleFromInstanceProfile
+                  - elasticfilesystem:DescribeTags
+                  - elasticfilesystem:CreateTags
+                  - elasticfilesystem:DeleteTags
+                  - elasticfilesystem:ModifyMountTargetSecurityGroups # parent
+                  - elasticfilesystem:DescribeMountTargets
+                  - secretsmanager:GetRandomPassword
+                Resource: '*'
+                Effect: Allow
+
+Outputs:
+  ArtifactStore:
+    Description: The S3 bucket used for the artifact storage
+    Value: !Ref ArtifactStore
+  RepositoryUrl:
+    Description: The repository with the sources for the stack
+    Value: !GetAtt Repository.CloneUrlHttp
+  DNSName:
+    Description: The DNS name for the publicly accessible endpoint
+    Value: !GetAtt WebLoadBalancer.DNSName

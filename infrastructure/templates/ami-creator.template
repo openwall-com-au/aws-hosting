@@ -1,0 +1,880 @@
+# vim:set ft=yaml ts=2 sts=2 sw=2 et:
+AWSTemplateFormatVersion: 2010-09-09
+Description: Images Creator
+
+Parameters:
+  RepositoryName:
+    Description: The name of the CodeCommit repository for image files
+    Type: String
+  BranchName:
+    Description: The repository branch CodeBuild will check out
+    Type: String
+    Default: master
+  ArtifactStore:
+    Description: An S3 bucket for the CodePipeline and CodeBuild
+    Type: String
+    Default: ''
+  ParentStackName:
+    Description: The name of the parent stack
+    Type: String
+    Default: ''
+  ParentStackRoleArn:
+    Description: An ARN for the role that is used to deploy the parent stack
+    Type: String
+    Default: ''
+  EncryptionKey:
+    Description: Custom KMS key to use for encryption
+    Type: String
+    Default: ''
+  VpcPublicCidr:
+    Type: String
+    Default: '10.0.0.0/22'
+  VpcPrivateCidr:
+    Type: String
+    Default: '10.0.0.0/22'
+  CodeBuildEnvironment:
+    Description: List of KEY=VALUE pairs that will be provided to CodeBuild
+    Type: CommaDelimitedList
+    Default: ''
+  CodeBuildRoleArn:
+    Description: A role CodeBuild will assume to launch and run agents
+    Type: String
+    Default: ''
+  AvailabilityZones:
+    Description: List of Availability Zones this infrastructure will be deployed to
+    Type: CommaDelimitedList
+    Default: ''
+  AvailabilityZonesCount:
+    Description: The number of Availability Zones this infrastructure will be deployed to
+    Type: Number
+    MinValue: 1
+    Default: 2
+
+Conditions:
+  useAvailabilityZones: !Not [ !Equals [ '', !Join [ '', !Ref AvailabilityZones ]]]
+  useAZ9: !Equals [ 9, !Ref AvailabilityZonesCount ]
+  useAZ8: !Or [ !Equals [ 8, !Ref AvailabilityZonesCount ], Condition: useAZ9 ]
+  useAZ7: !Or [ !Equals [ 7, !Ref AvailabilityZonesCount ], Condition: useAZ8 ]
+  useAZ6: !Or [ !Equals [ 6, !Ref AvailabilityZonesCount ], Condition: useAZ7 ]
+  useAZ5: !Or [ !Equals [ 5, !Ref AvailabilityZonesCount ], Condition: useAZ6 ]
+  useAZ4: !Or [ !Equals [ 4, !Ref AvailabilityZonesCount ], Condition: useAZ5 ]
+  useAZ3: !Or [ !Equals [ 3, !Ref AvailabilityZonesCount ], Condition: useAZ4 ]
+  useAZ2: !Or [ !Equals [ 2, !Ref AvailabilityZonesCount ], Condition: useAZ3 ]
+  useAZ1: !Or [ !Equals [ 1, !Ref AvailabilityZonesCount ], Condition: useAZ2 ]
+  useLocalArtifactStore: !Equals [ '', !Ref ArtifactStore ]
+  useEncryptionKey: !Not [ !Equals [ '', !Ref EncryptionKey ]]
+  useParentStack: !Not [ !Equals [ '', !Ref ParentStackName ]]
+  useCodeBuildEnvironment: !Not [ !Equals [ '', !Join ['', !Ref CodeBuildEnvironment ]]]
+  useCodeBuildRole: !Not [ !Equals [ '', !Ref CodeBuildRoleArn ]]
+  createCodeBuildRole: !Equals [ '', !Ref CodeBuildRoleArn ]
+
+Resources:
+  ArtifactStoreLocal:
+    Condition: useLocalArtifactStore
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    Properties:
+      AccessControl: Private
+      LifecycleConfiguration:
+        Rules:
+          - Prefix: ''
+            Status: Enabled
+            AbortIncompleteMultipartUpload:
+              DaysAfterInitiation: 1
+            NoncurrentVersionExpirationInDays: 6
+
+      VersioningConfiguration:
+        # Required for CodePipeline (XXX: is it now?)
+        Status: Enabled
+
+  CodeBuild:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      Artifacts:
+        Type: CODEPIPELINE
+      Description: !Sub CI/CD for devPanel AMIs (${AWS::StackName})
+      Environment:
+        ComputeType: BUILD_GENERAL1_SMALL
+        EnvironmentVariables:
+          - Name: STACK_NAME
+            Value: !Ref AWS::StackName
+          - Name: S3_BUCKET
+            Value: !If [ useLocalArtifactStore, !Ref ArtifactStoreLocal, !Ref ArtifactStore ]
+          - Name: PARENT_STACK_NAME
+            Value: !Ref ParentStackName
+          - Name: PARENT_STACK_ROLE
+            Value: !Ref ParentStackRoleArn
+          - !If
+            - useCodeBuildEnvironment
+            - Name: CICD_VARS
+              Value: !Join [ '\n', !Ref CodeBuildEnvironment ]
+            - !Ref 'AWS::NoValue'
+        Image: aws/codebuild/standard:1.0
+        Type: LINUX_CONTAINER
+      ServiceRole: !If
+        - useCodeBuildRole
+        - !Ref CodeBuildRoleArn
+        - !GetAtt CodeBuildRole.Arn
+      Source:
+        Type: CODEPIPELINE
+      TimeoutInMinutes: 15
+
+  CodeBuildLogGroup:
+    Type: AWS::Logs::LogGroup
+    DeletionPolicy: Retain
+    Properties: 
+      LogGroupName: !Sub /aws/codebuild/${CodeBuild}
+      RetentionInDays: 30
+
+  CodeBuildTimeMetric:
+    Type: AWS::Logs::MetricFilter
+    Properties:
+      LogGroupName: !Ref CodeBuildLogGroup
+      FilterPattern: '[marker=CODEBUILD_TIME, seconds, trailer="second(s)"]'
+      MetricTransformations:
+        - MetricName: BuildTime
+          MetricValue: $seconds
+          MetricNamespace: !Sub ${AWS::StackName}/CodeBuild
+
+  CodeBuildRole:
+    Condition: createCodeBuildRole
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Action:
+              - sts:AssumeRole
+            Principal:
+              Service:
+                - codebuild.amazonaws.com
+            Effect: Allow
+      Path: /
+      Policies:
+        - PolicyName: CodeBuild
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                  - logs:PutMetricFilter
+                  - logs:DeleteMetricFilter
+                Resource:
+                  # Need to think of something here since it is too generic and can bite us (maybe we need to use the ProjectName)
+                  - !Sub arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/codebuild/CodeBuild-*
+                  - !Sub arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/codebuild/CodeBuild-*:*
+                Effect: Allow
+              - Action:
+                  - s3:GetObject
+                Resource:
+                  # Cannot use a reference due to cyclic dependency
+                  - !If
+                    - useParentStack
+                    - !Sub arn:aws:s3:::${ParentStackName}-*/${ParentStackName}-*/*
+                    - !If
+                      - useLocalArtifactStore
+                      - !Sub arn:aws:s3:::${AWS::StackName}-*/${AWS::StackName}-*/*
+                      - !Sub arn:aws:s3:::${ArtifactStore}/${AWS::StackName}-*/*
+                Effect: Allow
+              - Action:
+                  - s3:PutObject
+                Resource:
+                  # Cannot use a reference due to cyclic dependency
+                  - !If
+                    - useParentStack
+                    - !Sub arn:aws:s3:::${ParentStackName}-*/bootstrap/*
+                    - !If
+                      - useLocalArtifactStore
+                      - !Sub arn:aws:s3:::${AWS::StackName}-*/bootstrap/*
+                      - !Sub arn:aws:s3:::${ArtifactStore}/bootstrap/*
+                  - !If
+                    - useParentStack
+                    - !Sub arn:aws:s3:::${ParentStackName}-*/cloudformation/*
+                    - !If
+                      - useLocalArtifactStore
+                      - !Sub arn:aws:s3:::${AWS::StackName}-*/cloudformation/*
+                      - !Sub arn:aws:s3:::${ArtifactStore}/cloudformation/*
+                  - !If
+                    - useParentStack
+                    - !Sub arn:aws:s3:::${ParentStackName}-*/${ParentStackName}-*/*
+                    - !If
+                      - useLocalArtifactStore
+                      - !Sub arn:aws:s3:::${AWS::StackName}-*/${AWS::StackName}-*/*
+                      - !Sub arn:aws:s3:::${ArtifactStore}/${AWS::StackName}-*/*
+                Effect: Allow
+              - Action:
+                  - cloudformation:DescribeStacks
+                Resource:
+                  - !Sub arn:aws:cloudformation:${AWS::Region}:${AWS::AccountId}:stack/${AWS::StackName}/*
+                  - !If
+                    - useParentStack
+                    - !Sub arn:aws:cloudformation:${AWS::Region}:${AWS::AccountId}:stack/${ParentStackName}/*
+                    - !Ref AWS::NoValue
+                Effect: Allow
+              - !If
+                - useParentStack
+                - Action:
+                    - cloudformation:GetTemplate
+                  Resource:
+                    - !Sub arn:aws:cloudformation:${AWS::Region}:${AWS::AccountId}:stack/${ParentStackName}/*
+                  Effect: Allow
+                - !Ref AWS::NoValue
+              - !If
+                - useParentStack
+                - Action:
+                    - secretsmanager:GetSecretValue
+                  Resource:
+                    #arn:aws:secretsmanager:us-west-2:323909408597:secret:secretDirectoryJoiner-DAPXXvH4oMi8-ndYcHQ
+                    - !Sub arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:${ParentStackName}/*
+                  Effect: Allow
+                - !Ref AWS::NoValue
+
+  CodePipeline:
+    Type: AWS::CodePipeline::Pipeline
+    Properties:
+      RoleArn: !GetAtt
+        - CodePipelineServiceRole
+        - Arn
+      RestartExecutionOnUpdate: False
+      ArtifactStore:
+        Type: S3
+        Location: !If [ useLocalArtifactStore, !Ref ArtifactStoreLocal, !Ref ArtifactStore ]
+      Stages:
+        - Name: Source
+          Actions:
+            - Name: SourceCodebase
+              ActionTypeId:
+                Category: Source
+                Owner: AWS
+                Provider: CodeCommit
+                Version: 1
+              Configuration:
+                RepositoryName: !Ref RepositoryName
+                BranchName: !Ref BranchName
+                PollForSourceChanges: False
+              OutputArtifacts:
+                - Name: SourceOutput
+              RunOrder: 1
+#       - Name: Source
+#         Actions:
+#           - Name: SourceCodebase
+#             ActionTypeId:
+#               Category: Source
+#               Owner: AWS
+#               Provider: S3
+#               Version: 1
+#             Configuration:
+#               S3Bucket: !Ref ArtifactStore
+#               S3ObjectKey: codebase/snapshot.zip
+#             OutputArtifacts:
+#               - Name: SourceOutput
+#             RunOrder: 1
+        - Name: Build
+          Actions:
+            - Name: Build
+              ActionTypeId:
+                Category: Build
+                Owner: AWS
+                Provider: CodeBuild
+                Version: 1
+              Configuration:
+                ProjectName: !Ref CodeBuild
+              InputArtifacts:
+                - Name: SourceOutput
+              OutputArtifacts:
+                - Name: BuildOutput
+              RunOrder: 1
+            - Name: CreateTemporaryVpc
+              ActionTypeId:
+                Category: Deploy
+                Owner: AWS
+                Provider: CloudFormation
+                Version: 1
+              Configuration:
+                ActionMode: REPLACE_ON_FAILURE
+                RoleArn: !GetAtt
+                  - CloudFormationServiceRole
+                  - Arn
+                StackName: !Sub ${AWS::StackName}-vpc
+                ChangeSetName: !Sub ${AWS::StackName}-vpc
+                TemplatePath: BuildOutput::vpc.template
+                TemplateConfiguration: BuildOutput::vpc.parameters
+                ParameterOverrides: !If
+                  - useAvailabilityZones
+                  - !Join
+                    - ''
+                    - - '{'
+                      - '"AvailabilityZones": "'
+                      - !Join [ ',', !Ref AvailabilityZones ]
+                      - '", "AvailabilityZonesCount": "'
+                      - !Ref AvailabilityZonesCount
+                      - '" }'
+                  - !Sub |
+                    {
+                      "AvailabilityZonesCount": "${AvailabilityZonesCount}"
+                    }
+                Capabilities: CAPABILITY_NAMED_IAM
+                OutputFileName: vpc-output.json
+              InputArtifacts:
+                - Name: BuildOutput
+              OutputArtifacts:
+                - Name: VpcStackOutput
+              RunOrder: 2
+            - Name: AssembleBastionAmi
+              ActionTypeId:
+                Category: Deploy
+                Owner: AWS
+                Provider: CloudFormation
+                Version: 1
+              Configuration:
+                ActionMode: REPLACE_ON_FAILURE
+                RoleArn: !GetAtt
+                  - CloudFormationServiceRole
+                  - Arn
+                StackName: !Sub ${AWS::StackName}-bastion-ami
+                ChangeSetName: !Sub ${AWS::StackName}-bastion-ami
+                TemplatePath: BuildOutput::ami.template
+                TemplateConfiguration: BuildOutput::bastion-ami.parameters
+                ParameterOverrides: !Sub
+                  - |
+                    {
+                      "VpcId" : { "Fn::GetParam" : [ "VpcStackOutput", "vpc-output.json", "VpcId" ] },
+                      "SubnetId" : { "Fn::GetParam" : [ "VpcStackOutput", "vpc-output.json", "SubnetPublicIds" ] },
+                      "S3Bucket": "${S3Bucket}/bootstrap",
+                      "AmiName": "${ParentStackName}/bastion",
+                      "UserData": { "Fn::GetParam" : [ "BuildOutput", "build-output.json", "BastionUserData" ] },
+                      "PreserveStack": "True"
+                    }
+                  - { S3Bucket: !If [ useLocalArtifactStore, !Ref ArtifactStoreLocal, !Ref ArtifactStore ] }
+                Capabilities: CAPABILITY_NAMED_IAM
+                OutputFileName: bastion-ami-output.json
+              InputArtifacts:
+                - Name: BuildOutput
+                - Name: VpcStackOutput
+              OutputArtifacts:
+                - Name: BastionStackOutput
+              RunOrder: 3
+            - Name: AssembleAppAmi
+              ActionTypeId:
+                Category: Deploy
+                Owner: AWS
+                Provider: CloudFormation
+                Version: 1
+              Configuration:
+                ActionMode: REPLACE_ON_FAILURE
+                RoleArn: !GetAtt
+                  - CloudFormationServiceRole
+                  - Arn
+                StackName: !Sub ${AWS::StackName}-app-ami
+                ChangeSetName: !Sub ${AWS::StackName}-app-ami
+                TemplatePath: BuildOutput::ami.template
+                TemplateConfiguration: BuildOutput::app-ami.parameters
+                ParameterOverrides: !Sub
+                  - |
+                    {
+                      "VpcId" : { "Fn::GetParam" : [ "VpcStackOutput", "vpc-output.json", "VpcId" ] },
+                      "SubnetId" : { "Fn::GetParam" : [ "VpcStackOutput", "vpc-output.json", "SubnetPublicIds" ] },
+                      "S3Bucket": "${S3Bucket}/bootstrap",
+                      "AmiName": "${ParentStackName}/app",
+                      "UserData": { "Fn::GetParam" : [ "BuildOutput", "build-output.json", "AppUserData" ] },
+                      "PreserveStack": "True"
+                    }
+                  - { S3Bucket: !If [ useLocalArtifactStore, !Ref ArtifactStoreLocal, !Ref ArtifactStore ] }
+                Capabilities: CAPABILITY_NAMED_IAM
+                OutputFileName: app-ami-output.json
+              InputArtifacts:
+                - Name: BuildOutput
+                - Name: VpcStackOutput
+              OutputArtifacts:
+                - Name: AppStackOutput
+              RunOrder: 3
+            - Name: AssembleWebAmi
+              ActionTypeId:
+                Category: Deploy
+                Owner: AWS
+                Provider: CloudFormation
+                Version: 1
+              Configuration:
+                ActionMode: REPLACE_ON_FAILURE
+                RoleArn: !GetAtt
+                  - CloudFormationServiceRole
+                  - Arn
+                StackName: !Sub ${AWS::StackName}-web-ami
+                ChangeSetName: !Sub ${AWS::StackName}-web-ami
+                TemplatePath: BuildOutput::ami.template
+                TemplateConfiguration: BuildOutput::web-ami.parameters
+                ParameterOverrides: !Sub
+                  - |
+                    {
+                      "VpcId" : { "Fn::GetParam" : [ "VpcStackOutput", "vpc-output.json", "VpcId" ] },
+                      "SubnetId" : { "Fn::GetParam" : [ "VpcStackOutput", "vpc-output.json", "SubnetPublicIds" ] },
+                      "S3Bucket": "${S3Bucket}/bootstrap",
+                      "AmiName": "${ParentStackName}/web",
+                      "UserData": { "Fn::GetParam" : [ "BuildOutput", "build-output.json", "WebUserData" ] },
+                      "PreserveStack": "True"
+                    }
+                  - { S3Bucket: !If [ useLocalArtifactStore, !Ref ArtifactStoreLocal, !Ref ArtifactStore ] }
+                Capabilities: CAPABILITY_NAMED_IAM
+                OutputFileName: web-ami-output.json
+              InputArtifacts:
+                - Name: BuildOutput
+                - Name: VpcStackOutput
+              OutputArtifacts:
+                - Name: WebStackOutput
+              RunOrder: 3
+            - Name: CleanUpBastion
+              ActionTypeId:
+                Category: Deploy
+                Owner: AWS
+                Provider: CloudFormation
+                Version: 1
+              Configuration:
+                ActionMode: DELETE_ONLY
+                RoleArn: !GetAtt
+                  - CloudFormationServiceRole
+                  - Arn
+                StackName: !Sub '${AWS::StackName}-bastion-ami'
+              RunOrder: 4
+            - Name: CleanUpApp
+              ActionTypeId:
+                Category: Deploy
+                Owner: AWS
+                Provider: CloudFormation
+                Version: 1
+              Configuration:
+                ActionMode: DELETE_ONLY
+                RoleArn: !GetAtt
+                  - CloudFormationServiceRole
+                  - Arn
+                StackName: !Sub '${AWS::StackName}-app-ami'
+              RunOrder: 4
+            - Name: CleanUpWeb
+              ActionTypeId:
+                Category: Deploy
+                Owner: AWS
+                Provider: CloudFormation
+                Version: 1
+              Configuration:
+                ActionMode: DELETE_ONLY
+                RoleArn: !GetAtt
+                  - CloudFormationServiceRole
+                  - Arn
+                StackName: !Sub '${AWS::StackName}-web-ami'
+              RunOrder: 4
+            - Name: CleanUp
+              ActionTypeId:
+                Category: Deploy
+                Owner: AWS
+                Provider: CloudFormation
+                Version: 1
+              Configuration:
+                ActionMode: DELETE_ONLY
+                RoleArn: !GetAtt
+                  - CloudFormationServiceRole
+                  - Arn
+                StackName: !Sub '${AWS::StackName}-vpc'
+              RunOrder: 5
+        - !If
+          - useParentStack
+          - Name: Deploy
+            Actions:
+              - Name: PrepareUpdate
+                ActionTypeId:
+                  Category: Deploy
+                  Owner: AWS 
+                  Provider: CloudFormation
+                  Version: 1
+                Configuration:
+                  ActionMode: CHANGE_SET_REPLACE
+                  RoleArn: !Ref ParentStackRoleArn
+                  StackName: !Ref ParentStackName
+                  ChangeSetName: !Ref ParentStackName
+                  TemplatePath: BuildOutput::update.template
+                  TemplateConfiguration: BuildOutput::update.parameters
+                  ParameterOverrides: |
+                    {
+                      "BastionImageId" : { "Fn::GetParam" : [ "BastionStackOutput", "bastion-ami-output.json", "AmiId" ]},
+                      "AppImageId" : { "Fn::GetParam" : [ "AppStackOutput", "app-ami-output.json", "AmiId" ]},
+                      "WebImageId" : { "Fn::GetParam" : [ "WebStackOutput", "web-ami-output.json", "AmiId" ]}
+                    }
+                  Capabilities: CAPABILITY_NAMED_IAM
+                InputArtifacts:
+                  - Name: BuildOutput
+                  - Name: BastionStackOutput
+                  - Name: AppStackOutput
+                  - Name: WebStackOutput
+                RunOrder: 1
+              - Name: ExecuteUpdate
+                ActionTypeId:
+                  Category: Deploy
+                  Owner: AWS
+                  Provider: CloudFormation
+                  Version: 1
+                Configuration:
+                  ActionMode: CHANGE_SET_EXECUTE
+                  ChangeSetName: !Ref ParentStackName
+                  StackName: !Ref ParentStackName
+                RunOrder: 6
+          - !Ref AWS::NoValue
+
+  CodePipelineServiceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Action:
+              - sts:AssumeRole
+            Principal:
+              Service:
+                - codepipeline.amazonaws.com
+            Effect: Allow
+      Path: /
+      Policies:
+        - PolicyName: CodePipeline
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Action:
+                  - s3:GetObject
+                  - s3:GetObjectVersion
+                  - s3:GetBucketVersioning
+                Resource:
+                  # Cannot use a reference due to cyclic dependency
+                  - arn:aws:s3:::*
+                  - !If
+                    - useParentStack
+                    - !Sub arn:aws:s3:::${ParentStackName}-*/codebase/*
+                    - !If
+                      - useLocalArtifactStore
+                      - !Sub arn:aws:s3:::${AWS::StackName}-*/codebase/*
+                      - !Sub arn:aws:s3:::${ArtifactStore}/codebase/*
+                Effect: Allow
+              - Action:
+                  - s3:PutObject
+                Resource:
+                  # Cannot use a reference due to cyclic dependency
+                  - !If
+                    - useParentStack
+                    - !Sub arn:aws:s3:::${ParentStackName}-*/${ParentStackName}-*/*
+                    - !If
+                      - useLocalArtifactStore
+                      - !Sub arn:aws:s3:::${AWS::StackName}-*/${AWS::StackName}-*/*
+                      - !Sub arn:aws:s3:::${ArtifactStore}/${AWS::StackName}-*/*
+                Effect: Allow
+              - Action:
+                  - codebuild:BatchGetBuilds
+                  - codebuild:StartBuild
+                Resource: '*'
+                Effect: Allow
+              - Action:
+                  - cloudformation:DescribeStacks
+                  - cloudformation:CreateStack
+                  - cloudformation:UpdateStack
+                  - cloudformation:DeleteStack
+                  - cloudformation:DescribeChangeSet
+                  - cloudformation:CreateChangeSet
+                  - cloudformation:ExecuteChangeSet
+                  - cloudformation:DeleteChangeSet
+                Resource:
+                  - !Sub arn:aws:cloudformation:${AWS::Region}:${AWS::AccountId}:stack/${AWS::StackName}/*
+                  - !Sub arn:aws:cloudformation:${AWS::Region}:${AWS::AccountId}:stack/${AWS::StackName}-vpc/*
+                  - !Sub arn:aws:cloudformation:${AWS::Region}:${AWS::AccountId}:changeSet/${AWS::StackName}-vpc/*
+                  - !Sub arn:aws:cloudformation:${AWS::Region}:${AWS::AccountId}:stack/${AWS::StackName}-bastion-ami/*
+                  - !Sub arn:aws:cloudformation:${AWS::Region}:${AWS::AccountId}:changeSet/${AWS::StackName}-bastion-ami/*
+                  - !Sub arn:aws:cloudformation:${AWS::Region}:${AWS::AccountId}:stack/${AWS::StackName}-app-ami/*
+                  - !Sub arn:aws:cloudformation:${AWS::Region}:${AWS::AccountId}:changeSet/${AWS::StackName}-app-ami/*
+                  - !Sub arn:aws:cloudformation:${AWS::Region}:${AWS::AccountId}:stack/${AWS::StackName}-web-ami/*
+                  - !Sub arn:aws:cloudformation:${AWS::Region}:${AWS::AccountId}:changeSet/${AWS::StackName}-web-ami/*
+                  - !If
+                    - useParentStack
+                    - !Sub arn:aws:cloudformation:${AWS::Region}:${AWS::AccountId}:stack/${ParentStackName}/*
+                    - !Ref AWS::NoValue
+                  - !If
+                    - useParentStack
+                    - !Sub arn:aws:cloudformation:${AWS::Region}:${AWS::AccountId}:changeSet/${ParentStackName}/*
+                    - !Ref AWS::NoValue
+                Effect: Allow
+              - Action:
+                  - iam:PassRole
+                Resource:
+                  - !GetAtt CloudFormationServiceRole.Arn
+                  - !If
+                    - useParentStack
+                    - !Ref ParentStackRoleArn
+                    - !Ref AWS::NoValue
+                Effect: Allow
+              - Action:
+                  - codecommit:GetBranch
+                  - codecommit:GetCommit
+                  - codecommit:UploadArchive
+                  - codecommit:GetUploadArchiveStatus
+                  - codecommit:CancelUploadArchive
+                # XXX: Need to be specific here
+                Resource: '*'
+                Effect: Allow
+
+  CloudFormationServiceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Action:
+              - sts:AssumeRole
+            Principal:
+              Service:
+                - cloudformation.amazonaws.com
+            Effect: Allow
+      Path: /
+      Policies:
+        - PolicyName: CloudFormation
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Action:
+                  - cloudformation:DescribeStacks
+                Resource:
+                  - !Sub arn:aws:cloudformation:${AWS::Region}:${AWS::AccountId}:stack/${AWS::StackName}-ami/*
+                Effect: Allow
+              - Action:
+                  - cloudformation:DescribeChangeSet
+                Resource:
+                  - '*'
+                Effect: Allow
+              - Action:
+                  - cloudformation:CreateChangeSet
+                Resource:
+                  - !Sub arn:aws:cloudformation:${AWS::Region}:${AWS::AccountId}:stack/${AWS::StackName}-ami/*
+                Effect: Allow
+              - Action:
+                  - iam:GetRole
+                  - iam:CreateRole
+                  - iam:DeleteRole
+                  - iam:GetRolePolicy
+                  - iam:PutRolePolicy
+                  - iam:DeleteRolePolicy
+                  - iam:AttachRolePolicy
+                  - iam:DetachRolePolicy
+                Resource:
+                  # Cannot use explicit references due to cyclic dependencies
+                  - !Sub arn:aws:iam::${AWS::AccountId}:role/*
+                Effect: Allow
+              - Action:
+                  - iam:PassRole
+                Resource: !If
+                  - useCodeBuildRole
+                  - !Ref CodeBuildRoleArn
+                  - !GetAtt
+                    - CodeBuildRole
+                    - Arn
+                Effect: Allow
+              - Action:
+                  - codepipeline:GetPipeline
+                  - codepipeline:CreatePipeline
+                  - codepipeline:UpdatePipeline
+                  - codepipeline:DeletePipeline
+                Resource:
+                  # Cannot use a reference due to cyclic dependency
+                  - !Sub arn:aws:codepipeline:${AWS::Region}:${AWS::AccountId}:${AWS::StackName}-*
+                Effect: Allow
+              - Action:
+                  - codebuild:CreateProject
+                  - codebuild:UpdateProject
+                  - codebuild:DeleteProject
+                  - codebuild:BatchGetProjects
+                Resource:
+                  #- !Sub 'arn:aws:codebuild:${AWS::Region}:${AWS::AccountId}:project/CodeBuild-*'
+                  - !GetAtt
+                    - CodeBuild
+                    - Arn
+                Effect: Allow
+              - Action:
+                  - s3:*
+                Resource:
+                  # Cannot use a reference due to cyclic dependency
+                  #- !Sub arn:aws:s3:::${AWS::StackName}-*
+                  #- !Sub arn:aws:s3:::${AWS::StackName}-*/*
+                  - !If
+                    - useParentStack
+                    - !Sub arn:aws:s3:::${ParentStackName}-*
+                    - !Sub arn:aws:s3:::${AWS::StackName}-*
+                  - !If
+                    - useParentStack
+                    - !Sub arn:aws:s3:::${ParentStackName}-*/*
+                    - !Sub arn:aws:s3:::${AWS::StackName}-*/*
+                  - !If
+                    - useLocalArtifactStore
+                    - !Ref AWS::NoValue
+                    - !Sub arn:aws:s3:::${ArtifactStore}/*
+                Effect: Allow
+              - Action:
+                  - logs:PutMetricFilter
+                  - logs:DeleteMetricFilter
+                Resource:
+                  # Cannot use a reference due to cyclic dependency
+                  - !Sub arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/codebuild/CodeBuild-*
+                  - !Sub arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/codebuild/CodeBuild-*:*
+                Effect: Allow
+              - Action:
+                  - ec2:DescribeAccountAttributes
+                  - ec2:DescribeAvailabilityZones
+                  - ec2:DescribeSubnets
+                  - ec2:DescribeNetworkAcls
+                  - ec2:CreateVpc # VPC
+                  - ec2:DeleteVpc
+                  - ec2:DescribeVpcs
+                  - ec2:DescribeVpcAttribute
+                  - ec2:ModifyVpcAttribute
+                  - ec2:CreateInternetGateway # VPC stack
+                  - ec2:DeleteInternetGateway # VPC stack (arn:aws:ec2:$region:$account:internet-gateway/igw-id)
+                  - ec2:AttachInternetGateway # VPC stack
+                  - ec2:DescribeInternetGateways # VPC stack
+                  - ec2:DetachInternetGateway # VPC stack
+                  - ec2:DeleteRouteTable # VPC stack (arn:aws:ec2:$region:$account:route-table/$route-table-id)
+                  - ec2:AssociateRouteTable
+                  - ec2:CreateRouteTable
+                  - ec2:DescribeRouteTables
+                  - ec2:DisassociateRouteTable
+                  - ec2:ReplaceRouteTableAssociation
+                  - ec2:CreateRoute
+                  - ec2:DeleteRoute # VPC (arn:aws:ec2:$region:$account:route-table/$route-table-id)
+                  - ec2:ReplaceRoute
+                  - ec2:CreateSubnet
+                  - ec2:DeleteSubnet
+                  - ec2:DescribeSubnets
+                  - ec2:ModifySubnetAttribute
+                  - ec2:CreateTags # VPC (multiple resources)
+                  - ec2:DeleteTags # VPC (multiple resources)
+                  - ec2:DescribeTags
+                  - ec2:AuthorizeSecurityGroupEgress # AMI (arn:aws:ec2:$region:$account:security-group/$security-group-id)
+                  - ec2:AuthorizeSecurityGroupIngress # AMI (arn:aws:ec2:$region:$account:security-group/$security-group-id)
+                  - ec2:DeleteSecurityGroup # AMI (arn:aws:ec2:$region:$account:security-group/$security-group-id)
+                  - ec2:RevokeSecurityGroupEgress # AMI (arn:aws:ec2:$region:$account:security-group/$security-group-id)
+                  - ec2:RevokeSecurityGroupIngress # AMI (arn:aws:ec2:$region:$account:security-group/$security-group-id)
+                  - ec2:CreateSecurityGroup
+                  - ec2:DescribeSecurityGroups
+                  - ssm:GetParameter # AMI (arn:aws:ssm:$region:$account:parameter/$name)
+                  - ssm:GetParameters # AMI (arn:aws:ssm:$region:$account:parameter/$name)
+                  - ssm:PutParameter # AMI (arn:aws:ssm:$region:$account:parameter/$name)
+                  - ssm:DeleteParameter # AMI (arn:aws:ssm:$region:$account:parameter/$name)
+                  - ssm:DescribeParameters
+                  - ec2:AssociateIamInstanceProfile # arn:aws:ec2:$region:$account:instance/$instance-id
+                  - ec2:DisassociateIamInstanceProfile # arn:aws:ec2:$region:$account:instance/$instance-id
+                  - ec2:ReplaceIamInstanceProfileAssociation # arn:aws:ec2:$region:$account:instance/$instance-id
+                  - iam:AddRoleToInstanceProfile # arn:aws:iam::$account:instance-profile/$instance-profile-name
+                  - iam:RemoveRoleFromInstanceProfile # same
+                  - iam:CreateInstanceProfile # arn:aws:iam::$account:instance-profile/$instance-profile-name
+                  - iam:DeleteInstanceProfile # arn:aws:iam::$account:instance-profile/$instance-profile-name
+                  - iam:GetInstanceProfile # same
+                  - iam:PassRole # arn:aws:iam::$account:role/$role-name
+                  - lambda:CreateFunction
+                  - lambda:DeleteFunction # arn:aws:lambda:$region:$account:function:$function-name
+                  - lambda:GetFunction # same
+                  - lambda:InvokeFunction # same
+                  - lambda:ListFunctions
+                  - lambda:UpdateFunctionCode # same
+                  - lambda:GetFunctionConfiguration # same
+                  - lambda:UpdateFunctionConfiguration # same
+                  - ec2:DescribeImages
+                  - ec2:DescribeInstances
+                  - ec2:ModifyInstanceAttribute # ?
+                  - ec2:RunInstances # multiple
+                  - ec2:TerminateInstances # arn:aws:ec2:$region:$account:instance/$instance-id
+                  - logs:CreateLogGroup # Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group/aws/lambda/${AWS::StackName}-ExtractAmiId-*'
+                  - logs:CreateLogStream # same
+                  - logs:PutLogEvents # same
+                Resource: '*'
+                Effect: Allow
+#             - Action:
+#                 - events:DescribeRule
+#                 - events:PutRule
+#                 - events:DeleteRule
+#                 - events:ListRules
+#                 - events:PutTargets
+#                 - events:RemoveTargets
+#                 - events:ListTargetsByRule
+#               Resource:
+#                 - !GetAtt
+#                   - ScheduledUpdateEvent
+#                   - Arn
+#               Effect: Allow
+
+  AmazonCloudWatchEventRule:
+    Type: AWS::Events::Rule
+    Properties:
+      EventPattern:
+        source:
+          - aws.codecommit
+        detail-type:
+          - 'CodeCommit Repository State Change'
+        resources:
+          - !Sub 'arn:aws:codecommit:${AWS::Region}:${AWS::AccountId}:${RepositoryName}'
+        detail:
+          event:
+            - referenceCreated
+            - referenceUpdated
+          referenceType:
+            - branch
+          referenceName:
+            - images
+      Targets:
+        - Arn: !Sub 'arn:aws:codepipeline:${AWS::Region}:${AWS::AccountId}:${CodePipeline}'
+          RoleArn: !GetAtt AmazonCloudWatchEventRole.Arn
+          Id: codepipeline-AmiPipeline
+
+  AmazonCloudWatchEventRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Action:
+            - sts:AssumeRole
+            Principal:
+              Service:
+                - events.amazonaws.com
+            Effect: Allow
+      Path: /
+      Policies:
+        - PolicyName: TriggerCodepipeline
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Action:
+                - codepipeline:StartPipelineExecution
+                Resource: !Sub 'arn:aws:codepipeline:${AWS::Region}:${AWS::AccountId}:${CodePipeline}'
+                Effect: Allow
+
+# ScheduledUpdateEvent:
+#   Type: AWS::Events::Rule
+#   Properties:
+#     Description: Force the execution of GitClone lambda to refresh artifacts from Git
+#     ScheduleExpression: 'cron(29 17 * * ? *)'
+#     Targets:
+#       - Arn: !Ref DevpanelUpdateSNS
+#         Id: !GetAtt
+#           - DevpanelUpdateSNS
+#           - TopicName
+#         Input: !Sub |-
+#           {
+#             "s3_location": "${ArtifactStore}/devpanel",
+#             "deploy_key": "${DevpanelKey}",
+#             "ref": "refs/heads/master",
+#             "commit_id": "",
+#             "comment": "Scheduled update",
+#             "sender": {
+#               "name": "devpanel",
+#               "email": "devpanel@devpanel.com"
+#             },
+#             "files": {
+#               "added": [],
+#               "removed": [],
+#               "modified": [],
+#               "changed": []
+#             },
+#             "ssh_url": "git@github.com:devpanel/devpanel.git"
+#           }
+

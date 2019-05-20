@@ -1,0 +1,116 @@
+# vim:set ft=yaml ts=2 sts=2 sw=2 et:
+---
+AWSTemplateFormatVersion: 2010-09-09
+Description: A set of default EC2 security groups (VPC)
+Parameters:
+  VpcId:
+    Description: The VPC Id where the set of security groups is going to be created
+    Type: AWS::EC2::VPC::Id
+
+Resources:
+  ssh:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Allow SSH
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          SourceSecurityGroupId: !GetAtt nat.GroupId
+      SecurityGroupEgress:
+        - IpProtocol: '-1'
+          FromPort: '-1'
+          ToPort: '-1'
+          CidrIp: 127.0.0.1/32
+      Tags:
+        - Key: Name
+          Value: ssh
+  http:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Allow HTTP
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+      SecurityGroupEgress:
+        - IpProtocol: '-1'
+          FromPort: '-1'
+          ToPort: '-1'
+          CidrIp: 127.0.0.1/32
+      Tags:
+        - Key: Name
+          Value: http
+  https:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Allow HTTPS
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 0.0.0.0/0
+      SecurityGroupEgress:
+        - IpProtocol: '-1'
+          FromPort: '-1'
+          ToPort: '-1'
+          CidrIp: 127.0.0.1/32
+      Tags:
+        - Key: Name
+          Value: https
+  nat:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Empty NAT/Bastion security group (should be populated by other stacks)
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: icmp
+          FromPort: '-1'
+          ToPort: '-1'
+          CidrIp: 0.0.0.0/0
+      SecurityGroupEgress:
+        - IpProtocol: icmp
+          FromPort: '-1'
+          ToPort: '-1'
+          CidrIp: 0.0.0.0/0
+      Tags:
+        - Key: Name
+          Value: nat
+  icmpReply:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Allow ICMP replies
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: icmp
+          FromPort: 8
+          ToPort: 8
+          CidrIp: 0.0.0.0/0
+      SecurityGroupEgress:
+        - IpProtocol: '-1'
+          FromPort: '-1'
+          ToPort: '-1'
+          CidrIp: 127.0.0.1/32
+      Tags:
+        - Key: Name
+          Value: icmp/reply
+Outputs:
+  ssh:
+    Description: The id of the group for allowing SSH
+    Value: !Ref ssh
+  http:
+    Description: The id of the group for allowing HTTP
+    Value: !Ref http
+  https:
+    Description: The id of the group for allowing HTTPS
+    Value: !Ref https
+  nat:
+    Description: The id of the group for NAT instances
+    Value: !Ref nat
+  icmpReply:
+    Description: The id of the group for allowing ICMP replies
+    Value: !Ref icmpReply

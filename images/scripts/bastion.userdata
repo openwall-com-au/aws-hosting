@@ -1,0 +1,353 @@
+#!/bin/bash
+
+safe_yum()
+{
+	# Sometimes we hit a bad mirror and yum fails with a timeout message, so
+	# let's try three times
+	I=0
+	until chroot "$BOOTSTRAP_MNT" yum -y "$@"
+	do
+	        RC=$?
+	        if [ $I -ge 2 ]; then
+	                echo "ERROR: yum failed 3 times with error code '$RC'!" >&2
+	                exit $RC
+	        fi
+	        echo "NOTICE: yum failed with error code '$RC', re-trying ..." >&2
+	        I=$(( I + 1 ))
+	done
+	unset I
+}
+
+[ -e "$BOOTSTRAP_MNT"/etc/resolv.conf -o -h "$BOOTSTRAP_MNT"/etc/resolv.conf ] \
+	&& mv -f "$BOOTSTRAP_MNT"/etc/resolv.conf{,.preserved} ||:
+cp -aL /etc/resolv.conf "$BOOTSTRAP_MNT"/etc/resolv.conf
+safe_yum install epel-release chrony postfix cachefilesd iptables{,-services} sudo
+safe_yum install nfs-utils adcli authconfig sssd-ad haveged awscli openldap-clients
+rm -f "$BOOTSTRAP_MNT"/etc/resolv.conf
+[ -e "$BOOTSTRAP_MNT"/etc/resolv.conf.preserved -o -h "$BOOTSTRAP_MNT"/etc/resolv.conf.preserved ] \
+	&& mv -f "$BOOTSTRAP_MNT"/etc/resolv.conf{.preserved,} ||:
+
+# clean up after yum
+rm -rf "$BOOTSTRAP_MNT"/var/cache/yum
+
+# time sync
+sed -i '$,/[[:space:]]*OPTIONS=/s,^\([[:space:]]*OPTIONS\)=.*,\1="-4 -F 1",' "$BOOTSTRAP_MNT"/etc/sysconfig/chronyd
+
+sed -i 's,^\([[:space:]]*server[[:space:]]\),#\1,' "$BOOTSTRAP_MNT"/etc/chrony.conf
+cat << "__EOF__" >> "$BOOTSTRAP_MNT"/etc/chrony.conf
+
+# we are using our local server
+server @@AD_DOMAIN@@ iburst
+
+# deny any external access
+deny all
+
+# randomize port
+port 0
+
+# Listen for commands only on localhost.
+bindcmdaddress 127.0.0.1
+bindcmdaddress ::1
+__EOF__
+
+cat > "$BOOTSTRAP_MNT"/usr/local/sbin/ec2-hostname.sh << "__EOF__"
+#!/bin/sh
+
+set -eu -o pipefail
+
+EC2_METADATA_URL='http://169.254.169.254/latest/meta-data/local-hostname'
+
+if ! OUTPUT=$(curl -qsS4f --retry 120 --retry-delay 1 "$EC2_METADATA_URL"); then
+        RC=$?
+        exit $RC
+fi
+H="${OUTPUT%%.*}"
+D="${OUTPUT#$H.}"
+
+hostnamectl set-hostname "${H}.id.${D}"
+__EOF__
+chmod 0700 "$BOOTSTRAP_MNT"/usr/local/sbin/ec2-hostname.sh
+
+cat > "$BOOTSTRAP_MNT"/etc/systemd/system/ec2-hostname.service << "__EOF__"
+[Unit]
+Description=EC2 hostname setter
+Documentation=https://none
+Requires=network-online.target
+After=systemd-networkd-wait-online.service
+Before=systemd-resolved.service
+ConditionVirtualization=vm
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/ec2-hostname.sh
+
+[Install]
+WantedBy=multi-user.target
+__EOF__
+chmod 0644 "$BOOTSTRAP_MNT"/etc/systemd/system/ec2-hostname.service
+
+# postfix
+# Avoid IPv6 initialisation in postfix
+chroot "$BOOTSTRAP_MNT" postconf -e inet_protocols=ipv4
+
+cat << "__EOF__" >> "$BOOTSTRAP_MNT"/etc/fstab
+LABEL=fs-cache	/var/cache/fscache	ext4	noauto,nosuid,noexec,nodev,noatime,nofail	0 2
+
+@@EFS_DNS@@:/home/users		/home/users	nfs4	nfsvers=4.1,rsize=1048576,wsize=1048576,hard,timeo=600,retrans=2,nosuid,nodev	0 0
+__EOF__
+
+cat << "__EOF__" > "$BOOTSTRAP_MNT"/usr/local/sbin/mount-fscache
+#!/bin/bash
+set -eu -o pipefail
+CANDIDATE=$(lsblk -d -n -p --output NAME | grep -E '/dev/((s|xv)dc|nvme2n1)$' | head -1)
+if ! OUTPUT=$(blkid "$CANDIDATE"); then
+	if [ $? -ne 2]; then
+        echo 'ERROR: encountered an unrecoverable error at blkid!' >&2
+        exit 1
+	fi
+fi
+
+if [ -z "$OUTPUT" ]; then
+        if ! mke2fs -t ext4 -L fs-cache -m0 -M /var/cache/fscache "$CANDIDATE"; then
+                echo 'ERROR: encountered an unrecoverable error at mke2fs!' >&2
+                exit 1
+        fi
+        if ! tune2fs -c 0 -i 0 "$CANDIDATE"; then
+                echo 'ERROR: encountered an unrecoverable error at tune2fs!' >&2
+                exit 1
+        fi
+fi
+
+if ! OUTPUT=$(blkid -L fs-cache); then
+	echo 'ERROR: encountered an unrecoverable error at blkid (2)!' >&2
+        exit 1
+fi
+
+if [ -n "$OUTPUT" ]; then
+	if ! mountpoint -q /var/cache/fscache; then
+		mount /var/cache/fscache
+		restorecon -R /var/cache/fscache
+	fi
+fi
+__EOF__
+chmod 0700 "$BOOTSTRAP_MNT"/usr/local/sbin/mount-fscache
+chown -h root:root "$BOOTSTRAP_MNT"/usr/local/sbin/mount-fscache
+
+# prepare a dedicated volume for caching (if it was attached as a 3rd device)
+install -d -m755 -o root -g root "$BOOTSTRAP_MNT"/etc/systemd/system/cachefilesd.service.d
+cat << "__EOF__" > "$BOOTSTRAP_MNT"/etc/systemd/system/cachefilesd.service.d/mount.conf
+[Service]
+ExecStartPre=/usr/local/sbin/mount-fscache
+__EOF__
+chmod 0644 "$BOOTSTRAP_MNT"/etc/systemd/system/cachefilesd.service.d/mount.conf
+chown -h root:root "$BOOTSTRAP_MNT"/etc/systemd/system/cachefilesd.service.d/mount.conf
+
+cat << "__EOF__" > "$BOOTSTRAP_MNT"/etc/systemd/system/join-ad-domain.service
+[Unit]
+Description=AD domain join
+Documentation=https://none
+Requires=ec2-user-data.service ec2-hostname.service
+After=ec2-user-data.service ec2-hostname.service
+Before=sssd.service
+ConditionPathExists=!/etc/krb5.keytab
+
+[Service]
+Type=oneshot
+EnvironmentFile=-/run/ec2-user-data.env
+ExecStart=/usr/local/sbin/join-ad-domain.sh $AD_USER $AD_DOMAIN $AD_PASS
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target
+__EOF__
+chmod 0644 "$BOOTSTRAP_MNT"/etc/systemd/system/join-ad-domain.service
+chown -h root:root "$BOOTSTRAP_MNT"/etc/systemd/system/join-ad-domain.service
+
+cat << "__EOF__" > "$BOOTSTRAP_MNT"/usr/local/sbin/join-ad-domain.sh
+#!/bin/bash
+AD_USER="${1:-@@AD_JOIN_USER@@}"
+AD_DOMAIN="${2:-@@AD_DOMAIN@@}"
+AD_PASS="${3:-@@AD_JOIN_PASS@@}"
+printf '%s' "$AD_PASS" | \
+        adcli join -v --stdin-password --show-details -U "$AD_USER" "$AD_DOMAIN"
+__EOF__
+chmod 0700 "$BOOTSTRAP_MNT"/usr/local/sbin/join-ad-domain.sh
+chown -h root:root "$BOOTSTRAP_MNT"/usr/local/sbin/join-ad-domain.sh
+
+cat << "__EOF__" > "$BOOTSTRAP_MNT"/etc/sssd/sssd.conf
+[sssd]
+domains = @@AD_DOMAIN@@, admin
+config_file_version = 2
+services = nss, pam, ssh
+
+[domain/@@AD_DOMAIN@@]
+ad_domain = @@AD_DOMAIN@@
+krb5_realm = @@AD_DOMAIN@@
+cache_credentials = True
+krb5_store_password_if_offline = True
+default_shell = /bin/bash
+ldap_id_mapping = True
+ldap_schema = ad
+ldap_search_base = @@LDAP_BASE@@
+ldap_idmap_autorid_compat = True
+ldap_idmap_default_domain = @@AD_DOMAIN@@
+fallback_homedir = /home/websites/%u
+use_fully_qualified_names = False
+id_provider = ad
+chpass_provider = ad
+access_provider = ad
+ad_access_filter = (&(memberOf=cn=virtwww,ou=Hosting,@@LDAP_BASE@@)(unixHomeDirectory=*))
+sudo_provider = none
+autofs_provider = none
+dyndns_update = True
+auto_private_groups = True
+
+[domain/admin]
+ad_domain = @@AD_DOMAIN@@
+krb5_realm = @@AD_DOMAIN@@
+cache_credentials = True
+krb5_store_password_if_offline = True
+default_shell = /bin/bash
+ldap_id_mapping = True
+ldap_schema = ad
+ldap_search_base = @@LDAP_BASE@@
+ldap_idmap_autorid_compat = True
+ldap_idmap_default_domain = @@AD_DOMAIN@@
+fallback_homedir = /home/users/%u
+use_fully_qualified_names = True
+id_provider = ad
+chpass_provider = ad
+access_provider = ad
+ad_access_filter = (&(memberOf=cn=admin,ou=Hosting,@@LDAP_BASE@@)(unixHomeDirectory=*))
+sudo_provider = none
+autofs_provider = none
+dyndns_update = False
+auto_private_groups = True
+ldap_user_ssh_public_key = comment
+__EOF__
+chmod 0600 "$BOOTSTRAP_MNT"/etc/sssd/sssd.conf
+chown -h root:root "$BOOTSTRAP_MNT"/etc/sssd/sssd.conf
+
+cat << "__EOF__" > "$BOOTSTRAP_MNT"/etc/sudoers.d/admin
+%admin	ALL=(ALL)	NOPASSWD: ALL
+__EOF__
+chmod 0440 "$BOOTSTRAP_MNT"/etc/sudoers.d/admin
+chown -h root:root "$BOOTSTRAP_MNT"/etc/sudoers.d/admin
+
+sed -i 's#chmod 0700 /usr/bin/sudo[[:space:]]*$#chgrp -h admin /usr/bin/sudo ; chmod u=sx,g=x,o= /usr/bin/sudo#g' "$BOOTSTRAP_MNT"/etc/yum/post-actions/check-sugid.action
+
+cat << "__EOF__" > "$BOOTSTRAP_MNT"/usr/local/sbin/authorized_keys_from_ad
+#!/bin/bash
+exec /usr/bin/sss_ssh_authorizedkeys "$@"
+__EOF__
+chmod 0750 "$BOOTSTRAP_MNT"/usr/local/sbin/authorized_keys_from_ad
+chown -h root:nobody "$BOOTSTRAP_MNT"/usr/local/sbin/authorized_keys_from_ad
+
+sed -i 's,^[[:space:]]*#\?[[:space:]]*AuthorizedKeysCommand[[:space:]].*,AuthorizedKeysCommand /usr/local/sbin/authorized_keys_from_ad,;s,^[[:space:]]*#\?[[:space:]]*AuthorizedKeysCommandUser[[:space:]].*,AuthorizedKeysCommandUser nobody,' \
+	"$BOOTSTRAP_MNT"/etc/ssh/sshd_config
+
+cat << "__EOF__" > "$BOOTSTRAP_MNT"/etc/systemd/network/zzz-default.network
+[Network]
+DHCP=yes
+LLMNR=no
+IPForward=yes
+
+[DHCP]
+UseMTU=true
+UseDomains=true
+UseHostname=false
+__EOF__
+chmod 0644 "$BOOTSTRAP_MNT"/etc/systemd/network/zzz-default.network
+chown -h root:root "$BOOTSTRAP_MNT"/etc/systemd/network/zzz-default.network
+
+cat << "__EOF__" > "$BOOTSTRAP_MNT"/etc/sysconfig/iptables
+*filter
+:INPUT ACCEPT [0:0]
+:FORWARD ACCEPT [0:0]
+:OUTPUT ACCEPT [0:0]
+-A INPUT -m state --state INVALID -j DROP
+# If it was already established pass bits through
+-A INPUT -m state --state RELATED,ESTABLISHED -j ACCEPT
+# Allow for the local traffic
+-A INPUT -i lo -j ACCEPT
+# Let's MTU discovery and other network management to work properly
+-A INPUT -p icmp -m icmp --icmp-type any -j ACCEPT
+# Allow remote SSH logins
+-A INPUT -p tcp -m state --state NEW -m tcp --dport 22 -j ACCEPT
+# Allow DHCP client to get its information
+-A INPUT -i ens5 -p udp -m state --state NEW -m udp --sport 67:68 --dport 67:68 -j ACCEPT
+
+# Reject anything that we did not specifically allow above
+-A INPUT -j REJECT --reject-with icmp-host-prohibited
+COMMIT
+__EOF__
+chmod 0644 "$BOOTSTRAP_MNT"/etc/sysconfig/iptables
+
+# The bootstraping code should have already created this directory,
+# but if it is not there, lets create it.
+mkdir -p -m0700 "$BOOTSTRAP_MNT"/root/bootstrap.d
+
+cat << "__EOF__" > "$BOOTSTRAP_MNT"/root/bootstrap.d/000-init.sh
+set -eu -o pipefail
+
+INSTANCE_DOC=$(curl -qsS4f --retry 60 --retry-delay 1 http://169.254.169.254/latest/dynamic/instance-identity/document)
+AWS_DEFAULT_REGION=$(printf '%s' "$INSTANCE_DOC" | sed -n 's|.*"region"[[:space:]]*:[[:space:]]*"\([^"]\+\)".*|\1|g;T;p' | tail -1)
+INSTANCE_ID=$(printf '%s' "$INSTANCE_DOC" | sed -n 's|.*"instanceId"[[:space:]]*:[[:space:]]*"\([^"]\+\)".*|\1|g;T;p' | tail -1)
+export AWS_DEFAULT_REGION
+
+trap '
+	RC=$?
+	trap - ERR HUP INT QUIT PIPE EXIT
+	[ -z "${STACK_NAME:-}" ] || \
+	aws cloudformation signal-resource \
+		--stack-name "${STACK_NAME:-NoStack}" \
+		--logical-resource-id AutoScalingGroup \
+		--unique-id "$INSTANCE_ID" \
+		--status FAILURE
+	exit $RC
+' ERR HUP INT QUIT PIPE EXIT
+__EOF__
+
+cat << "__EOF__" > "$BOOTSTRAP_MNT"/root/bootstrap.d/010-sssd.sh
+	# We rely on sssd being up and running and being able to retrieve info, so let's check it
+	for attempt in {1..9}
+	do
+		RC=0
+		getent group admin >/dev/null 2>&1 || RC=$?
+		[ $RC -ne 0 ] || break
+		sleep 5
+	done
+__EOF__
+
+cat << "__EOF__" > "$BOOTSTRAP_MNT"/root/bootstrap.d/020-sudo.sh
+FIX_SUDO=$(grep '^/usr/bin/sudo:update' /etc/yum/post-actions/check-sugid.action | tail -1 | cut -f3- -d:)
+[ -z "$FIX_SUDO" ] || eval "$FIX_SUDO"
+__EOF__
+
+cat << "__EOF__" > "$BOOTSTRAP_MNT"/root/bootstrap.d/030-selinux.sh
+semanage login --add -s root -r s0-s0:c0.c1023 %admin
+__EOF__
+
+cat << "__EOF__" > "$BOOTSTRAP_MNT"/root/bootstrap.d/999-epilogue.sh
+[ -z "${STACK_NAME:-}" ] || \
+aws cloudformation signal-resource --stack-name "${STACK_NAME:-NoStack}" --logical-resource-id AutoScalingGroup --unique-id "$INSTANCE_ID" --status SUCCESS ||:
+trap - EXIT
+__EOF__
+
+chmod 0600 "$BOOTSTRAP_MNT"/root/bootstrap.d/*.sh
+chown -h root:root "$BOOTSTRAP_MNT"/root/bootstrap.d/*.sh
+
+chroot "$BOOTSTRAP_MNT" /bin/sh -exuc "\
+	semanage boolean -N --modify --on use_nfs_home_dirs
+
+	authconfig --enablesssd --enablesssdauth --update
+
+	systemctl enable chronyd haveged postfix sssd iptables --no-reload
+	systemctl enable systemd-resolved-wait-online.service --no-reload
+	systemctl enable join-ad-domain.service --no-reload
+
+	systemctl disable rpcbind.{service,socket} --no-reload
+	systemctl mask auth-rpcgss-module.service --no-reload
+
+	printf '\n%s\n%s\n' 'set -x' 'for s in /root/bootstrap.d/*.sh ; do . \$s ; done' >> /usr/local/sbin/ec2-bootstrap.sh
+"

@@ -1,0 +1,249 @@
+# vim:set ft=yaml ts=2 sts=2 sw=2 et:
+#
+# Copyright (c) 2019 Openwall Pty Ltd
+#
+---
+AWSTemplateFormatVersion: 2010-09-09
+Description: Customer managed CMK
+Parameters:
+  AlertTopic:
+    Description: SNS Topic for alerting
+    Type: String
+    Default: ''
+  Service:
+    Description: 'Which AWS service is allowed to use this CMK?'
+    Type: String
+    AllowedValues:
+    - ALL_SERVICES
+    - S3_PUBLIC_ACCESS
+    - backup
+    - connect
+    - dms
+    - directoryservice
+    - ssm
+    - ec2
+    - elasticfilesystem
+    - es
+    - fsx
+    - glue
+    - kafka
+    - kinesis
+    - kinesisvideo
+    - lambda
+    - lex
+    - redshift
+    - rds
+    - secretsmanager
+    - ses
+    - sns
+    - s3
+    - importexport
+    - sqs
+    - workmail
+    - workspaces
+    - xray
+    Default: ALL_SERVICES
+  KeyDescription:
+    Description: Optional description for the key
+    Type: String
+    Default: ''
+  Enabled:
+    Description: Indicates whether the key is enabled or not
+    Type: String
+    AllowedValues:
+      - true
+      - false
+    Default: true
+  EnableKeyRotation:
+    Description: Indicates whether AWS KMS rotates the key
+    Type: String
+    AllowedValues:
+      - true
+      - false
+    Default: false
+  DeletionPolicy:
+    Description: Specifies the policy applied to the key on stack deletion
+    Type: String
+    AllowedValues:
+      - Retain
+      - ''
+    Default: ''
+
+Conditions:
+  hasAlertTopic: !Not [ !Equals [ !Ref AlertTopic, '' ]]
+  hasServiceAllServices: !Equals [ !Ref Service, ALL_SERVICES ]
+  hasServiceS3PublicAccess: !Equals [ !Ref Service, S3_PUBLIC_ACCESS ]
+  DeletionPolicyRetain: !Equals [ !Ref DeletionPolicy, 'Retain' ]
+  DeletionPolicyDelete: !Not [ !Equals [ !Ref DeletionPolicy, 'Retain' ]]
+  hasKeyDescription: !Not [ !Equals [ !Ref KeyDescription, '' ]]
+
+Resources:
+  Key:
+    Condition: DeletionPolicyRetain
+    DeletionPolicy: Retain
+    Type: AWS::KMS::Key
+    Properties:
+      Description: !If
+        - hasKeyDescription
+        - KeyDescription
+        - !Ref AWS::NoValue
+      Enabled: !Ref Enabled
+      EnableKeyRotation: !Ref EnableKeyRotation
+      PendingWindowInDays: 7
+      KeyPolicy:
+        Version: 2012-10-17
+        Statement:
+        - Action: kms:*
+          Principal:
+            AWS: !Sub arn:aws:iam::${AWS::AccountId}:root # XXX: should we rethink this?
+          Resource: '*'
+          Effect: Allow
+        - Action:
+          - kms:Encrypt
+          - kms:Decrypt
+          - kms:ReEncrypt*
+          - kms:GenerateDataKey*
+          - kms:CreateGrant
+          - kms:ListGrants
+          - kms:DescribeKey
+          Principal:
+            AWS: '*'
+          Resource: '*'
+          Condition:
+            StringEquals: !If
+            - hasServiceAllServices
+            - kms:CallerAccount: !Ref AWS::AccountId
+            - kms:CallerAccount: !Ref AWS::AccountId
+              kms:ViaService: !Sub ${Service}.${AWS::Region}.amazonaws.com
+          Effect: Allow
+        - !If
+          - hasServiceS3PublicAccess
+          - Action:
+            - kms:Decrypt
+            Principal:
+              AWS: '*'
+            Resource: '*'
+            Condition:
+              StringEquals:
+                kms:ViaService: !Sub s3.${AWS::Region}.amazonaws.com
+            Effect: Allow
+          - !Ref AWS::NoValue
+
+  Key:
+    Condition: DeletionPolicyDelete
+    Type: AWS::KMS::Key
+    Properties:
+      Description: !If
+        - hasKeyDescription
+        - KeyDescription
+        - !Ref AWS::NoValue
+      Enabled: !Ref Enabled
+      EnableKeyRotation: !Ref EnableKeyRotation
+      PendingWindowInDays: 7
+      KeyPolicy:
+        Version: 2012-10-17
+        Statement:
+        - Action: kms:*
+          Principal:
+            AWS: !Sub arn:aws:iam::${AWS::AccountId}:root # XXX: should we rethink this?
+          Resource: '*'
+          Effect: Allow
+        - Action:
+          - kms:Encrypt
+          - kms:Decrypt
+          - kms:ReEncrypt*
+          - kms:GenerateDataKey*
+          - kms:CreateGrant
+          - kms:ListGrants
+          - kms:DescribeKey
+          Principal:
+            AWS: '*'
+          Resource: '*'
+          Condition:
+            StringEquals: !If
+            - hasServiceAllServices
+            - kms:CallerAccount: !Ref AWS::AccountId
+            - kms:CallerAccount: !Ref AWS::AccountId
+              kms:ViaService: !Sub ${Service}.${AWS::Region}.amazonaws.com
+          Effect: Allow
+        - !If
+          - hasServiceS3PublicAccess
+          - Action:
+            - kms:Decrypt
+            Principal:
+              AWS: '*'
+            Resource: '*'
+            Condition:
+              StringEquals:
+                kms:ViaService: !Sub s3.${AWS::Region}.amazonaws.com
+            Effect: Allow
+          - !Ref AWS::NoValue
+
+  KeyAlias:
+    Condition: DeletionPolicyRetain
+    DeletionPolicy: Retain
+    Type: AWS::KMS::Alias
+    Properties:
+      AliasName: !Sub alias/${AWS::StackName}
+      TargetKeyId: !Ref Key
+  DeletionNotification:
+    Condition: hasAlertTopic
+    Type: AWS::Events::Rule
+    Properties:
+      EventPattern:
+        source:
+        - aws.kms
+        detail-type:
+        - AWS API Call via CloudTrail
+        resources:
+        - !GetAtt Key.Arn
+        detail:
+          eventSource:
+          - kms.amazonaws.com
+          eventName:
+          - ScheduleKeyDeletion
+          - DisableKey
+      State: ENABLED
+      Targets:
+      - Arn: !Ref AlertTopic
+        Id: rule
+
+  KeyAlias:
+    Condition: DeletionPolicyDelete
+    Type: AWS::KMS::Alias
+    Properties:
+      AliasName: !Sub alias/${AWS::StackName}
+      TargetKeyId: !Ref Key
+  DeletionNotification:
+    Condition: hasAlertTopic
+    Type: AWS::Events::Rule
+    Properties:
+      EventPattern:
+        source:
+        - aws.kms
+        detail-type:
+        - AWS API Call via CloudTrail
+        resources:
+        - !GetAtt Key.Arn
+        detail:
+          eventSource:
+          - kms.amazonaws.com
+          eventName:
+          - ScheduleKeyDeletion
+          - DisableKey
+      State: ENABLED
+      Targets:
+      - Arn: !Ref AlertTopic
+        Id: rule
+
+Outputs:
+  KeyId:
+    Description: KMS Key ID
+    Value: !Ref Key
+    Export:
+      Name: !Sub ${AWS::StackName}-KeyId
+  KeyArn:
+    Description: KMS Key ARN
+    Value: !GetAtt Key.Arn
+    Export:
+      Name: !Sub ${AWS::StackName}-KeyArn

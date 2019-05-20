@@ -1,0 +1,600 @@
+# vim:set ft=yaml ts=2 sts=2 sw=2 et:
+---
+AWSTemplateFormatVersion: 2010-09-09
+Description: CI/CD framework
+
+Parameters:
+  RepositoryName:
+    Description: The name of the CodeCommit repository for infrastructure files
+    Type: String
+  BranchName:
+    Description: The repository branch CodeBuild will check out
+    Type: String
+    Default: master
+  BuildSpec:
+    Description: BuildSpec to use for the CodeBuild
+    Type: String
+    Default: ''
+  ArtifactStore:
+    Description: An S3 bucket for the CodePipeline and CodeBuild
+    Type: String
+    Default: ''
+  ParentStackName:
+    Description: The name of the parent stack
+    Type: String
+    Default: ''
+  CloudFormationServiceRoleArn:
+    Description: An ARN for the role that is used to deploy the parent stack
+    Type: String
+    Default: ''
+  VpcId:
+    Description: The VPC ID this pipeline should be deployed to (if any)
+    Type: String
+    Default: ''
+  Subnets:
+    Description: Subnet IDs CodeBuild should use to deploy build agents
+    Type: CommaDelimitedList
+    Default: ''
+  SecurityGroupIds:
+    Description: List of Security Group IDs to associate with build agents
+    Type: CommaDelimitedList
+    Default: ''
+  EncryptionKey:
+    Description: Custom KMS key to use for encryption
+    Type: String
+    Default: ''
+  PrivilegedMode:
+    Description: Whether to use CodeBuild in PrivilegedMode or not
+    Type: String
+    AllowedValues: [ false, true ]
+    Default: false
+  TemplateName:
+    Description: Base name for the Build output template to be used for the Deploy action
+    Type: String
+    Default: output
+  CodeBuildEnvironment:
+    Description: List of KEY=VALUE pairs that will be provided to CodeBuild
+    Type: CommaDelimitedList
+    Default: ''
+  CodeBuildRoleArn:
+    Description: A role CodeBuild will assume to launch and run agents
+    Type: String
+    Default: ''
+
+Conditions:
+  useParentStack: !Not [ !Equals [ '', !Ref ParentStackName ]]
+  useLocalArtifactStore: !Equals [ '', !Ref ArtifactStore ]
+  useVpc: !Not [ !Equals [ '', !Ref VpcId ]]
+  useEncryptionKey: !Not [ !Equals [ '', !Ref EncryptionKey ]]
+  useSecurityGroupIds: !Not [ !Equals [ '', !Join ['', !Ref SecurityGroupIds ]]]
+  useCodeBuildEnvironment: !Not [ !Equals [ '', !Join ['', !Ref CodeBuildEnvironment ]]]
+  useCodeBuildRole: !Not [ !Equals [ '', !Ref CodeBuildRoleArn ]]
+  useBuildSpec: !Not [ !Equals [ '', !Ref BuildSpec ]]
+  createCodeBuildRole: !Equals [ '', !Ref CodeBuildRoleArn ]
+  createCloudFormationRole: !Equals [ '', !Ref ParentStackName ]
+
+Resources:
+  ArtifactStoreLocal:
+    Condition: useLocalArtifactStore
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    Properties:
+      AccessControl: Private
+      LifecycleConfiguration:
+        Rules:
+          - Prefix: ''
+            Status: Enabled
+            AbortIncompleteMultipartUpload:
+              DaysAfterInitiation: 1
+            NoncurrentVersionExpirationInDays: 6
+
+      VersioningConfiguration:
+        # Required for CodePipeline (XXX: is it now?)
+        Status: Enabled
+
+  CodeBuild:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      EncryptionKey: !If [ useEncryptionKey, !Ref EncryptionKey, !Ref 'AWS::NoValue' ]
+      VpcConfig: !If
+        - useVpc
+        - VpcId: !Ref VpcId
+          Subnets: !Ref Subnets
+          SecurityGroupIds: !If [ useSecurityGroupIds, !Ref SecurityGroupIds, !Ref 'AWS::NoValue' ]
+        - !Ref 'AWS::NoValue'
+      Artifacts:
+        Type: CODEPIPELINE
+      Description: !If
+        - useParentStack
+        - !Sub CI/CD for ${ParentStackName}
+        - !Sub CI/CD for ${AWS::StackName}
+      Environment:
+        ComputeType: BUILD_GENERAL1_SMALL
+        EnvironmentVariables:
+          - Name: STACK_NAME
+            Value: !Ref AWS::StackName
+          - Name: S3_BUCKET
+            Value: !If [ useLocalArtifactStore, !Ref ArtifactStoreLocal, !Ref ArtifactStore ]
+          - !If
+            - useParentStack
+            - Name: PARENT_STACK_NAME
+              Value: !Ref ParentStackName
+            - !Ref 'AWS::NoValue'
+          - !If
+            - useCodeBuildEnvironment
+            - Name: CICD_VARS
+              Value: !Join [ '\n', !Ref CodeBuildEnvironment ]
+            - !Ref 'AWS::NoValue'
+        Image: aws/codebuild/standard:1.0
+        PrivilegedMode: !Ref PrivilegedMode
+        Type: LINUX_CONTAINER
+      ServiceRole: !If
+        - useCodeBuildRole
+        - !Ref CodeBuildRoleArn
+        - !GetAtt CodeBuildRole.Arn
+      Source:
+        Type: CODEPIPELINE
+        BuildSpec: !If
+          - useBuildSpec
+          - !Ref BuildSpec
+          - !Ref 'AWS::NoValue'
+      TimeoutInMinutes: 15
+
+  CodeBuildLogGroup:
+    Type: AWS::Logs::LogGroup
+    DeletionPolicy: Retain
+    Properties: 
+      LogGroupName: !Sub /aws/codebuild/${CodeBuild}
+      RetentionInDays: 30
+
+# CodeBuildTimeMetric:
+#   Type: AWS::Logs::MetricFilter
+#   Properties:
+#     LogGroupName: !Ref CodeBuildLogGroup
+#     FilterPattern: '[marker=CODEBUILD_TIME, seconds, trailer="second(s)"]'
+#     MetricTransformations:
+#       - MetricName: BuildTime
+#         MetricValue: $seconds
+#         MetricNamespace: !Sub ${AWS::StackName}/CodeBuild
+
+  CodeBuildRole:
+    Condition: createCodeBuildRole
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Action:
+              - sts:AssumeRole
+            Principal:
+              Service:
+                - codebuild.amazonaws.com
+            Effect: Allow
+      Path: /
+      Policies:
+        - PolicyName: CodeBuild
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Action:
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+#                 - logs:PutMetricFilter
+#                 - logs:DeleteMetricFilter
+                Resource:
+                  # Need to think of something here since it is too generic and can bite us (maybe we need to use the ProjectName)
+                  - !Sub arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/codebuild/CodeBuild-*
+                  - !Sub arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/codebuild/CodeBuild-*:*
+                Effect: Allow
+              - Action:
+                  - s3:GetObject
+                Resource:
+                  # Cannot use a reference due to cyclic dependency
+                  - !If
+                    - useParentStack
+                    - !Sub arn:aws:s3:::${ParentStackName}-*/${ParentStackName}-*/*
+                    - !If
+                      - useLocalArtifactStore
+                      - !Sub arn:aws:s3:::${AWS::StackName}-*/${AWS::StackName}-*/*
+                      - !Sub arn:aws:s3:::${ArtifactStore}/${AWS::StackName}-*/*
+                Effect: Allow
+              - Action:
+                  - s3:PutObject
+                Resource:
+                  # Cannot use a reference due to cyclic dependency
+                  - !If
+                    - useParentStack
+                    - !Sub arn:aws:s3:::${ParentStackName}-*
+                    - !If
+                      - useLocalArtifactStore
+                      - !Sub arn:aws:s3:::${AWS::StackName}-*
+                      - !Sub arn:aws:s3:::${ArtifactStore}/*
+                Effect: Allow
+              - Action:
+                  - cloudformation:DescribeStacks
+                Resource:
+                  - !If
+                    - useParentStack
+                    - !Sub arn:aws:cloudformation:${AWS::Region}:${AWS::AccountId}:stack/${ParentStackName}/*
+                    - !Sub arn:aws:cloudformation:${AWS::Region}:${AWS::AccountId}:stack/${AWS::StackName}/*
+                Effect: Allow
+              - Action:
+                  - cloudformation:GetTemplate
+                Resource: !If
+                  - useParentStack
+                  - !Sub arn:aws:cloudformation:${AWS::Region}:${AWS::AccountId}:stack/${ParentStackName}/*
+                  - !Sub arn:aws:cloudformation:${AWS::Region}:${AWS::AccountId}:stack/${AWS::StackName}/*
+                Effect: Allow
+              - Action:
+                  - ssm:GetParameters
+                Resource:
+                  - !Sub arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/aws/reference/secretsmanager/*
+                Effect: Allow
+              - !If
+                - useVpc
+                - Action: # VPC support requires this
+                    - ec2:DescribeVpcs
+                    - ec2:DescribeDhcpOptions
+                    - ec2:DescribeSubnets
+                    - ec2:DescribeSecurityGroups
+                    - ec2:DescribeNetworkInterfaces
+                    - ec2:CreateNetworkInterface
+                    - ec2:DeleteNetworkInterface
+                  Resource:
+                    - '*'
+                  Effect: Allow
+                - !Ref AWS::NoValue
+              - !If
+                - useVpc
+                - Action: # VPC support requires this
+                    - ec2:CreateNetworkInterfacePermission
+                  Resource:
+                    - !Sub arn:aws:ec2:${AWS::Region}:${AWS::AccountId}:network-interface/*
+                  Condition:
+                    StringEquals:
+                      ec2:AuthorizedService: codebuild.amazonaws.com
+#                     ec2:Subnet:
+#                       - !Sub arn:aws:ec2:${AWS::Region}:${AWS::AccountId}:subnet/* # XXX: should figure out a way how to use Subnets here
+                  Effect: Allow
+                - !Ref AWS::NoValue
+              - Action:
+                  - secretsmanager:GetSecretValue
+                Resource:
+                  - !Sub arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:${ParentStackName}/*
+                Effect: Allow
+
+  CodePipeline:
+    Type: AWS::CodePipeline::Pipeline
+    Properties:
+      RoleArn: !GetAtt CodePipelineServiceRole.Arn
+      RestartExecutionOnUpdate: False
+      ArtifactStore:
+        Type: S3
+        Location: !If [ useLocalArtifactStore, !Ref ArtifactStoreLocal, !Ref ArtifactStore ]
+      Stages:
+        - Name: Source
+          Actions:
+            - Name: SourceCodebase
+              ActionTypeId:
+                Category: Source
+                Owner: AWS
+                Provider: CodeCommit
+                Version: 1
+              Configuration:
+                RepositoryName: !Ref RepositoryName
+                BranchName: !Ref BranchName
+                PollForSourceChanges: False
+              OutputArtifacts:
+                - Name: SourceOutput
+              RunOrder: 1
+        - Name: Build
+          Actions:
+            - Name: Build
+              ActionTypeId:
+                Category: Build
+                Owner: AWS
+                Provider: CodeBuild
+                Version: 1
+              Configuration:
+                ProjectName: !Ref CodeBuild
+              InputArtifacts:
+                - Name: SourceOutput
+              OutputArtifacts:
+                - Name: BuildOutput
+              RunOrder: 1
+        - Name: Deploy
+          Actions:
+            - !If
+              - useParentStack
+              - Name: PrepareParentStackUpdate
+                ActionTypeId:
+                  Category: Deploy
+                  Owner: AWS
+                  Provider: CloudFormation
+                  Version: 1
+                Configuration:
+                  ActionMode: CHANGE_SET_REPLACE
+                  RoleArn: !Ref CloudFormationServiceRoleArn
+                  StackName: !Ref ParentStackName
+                  ChangeSetName: ParentStackUpdate
+                  TemplatePath: !Sub BuildOutput::${TemplateName}.template
+                  TemplateConfiguration: !Sub BuildOutput::${TemplateName}.parameters
+                  Capabilities: CAPABILITY_NAMED_IAM,CAPABILITY_AUTO_EXPAND
+                InputArtifacts:
+                  - Name: BuildOutput
+                RunOrder: 1
+              - Name: PrepareStackUpdate
+                ActionTypeId:
+                  Category: Deploy
+                  Owner: AWS
+                  Provider: CloudFormation
+                  Version: 1
+                Configuration:
+                  ActionMode: CHANGE_SET_REPLACE
+                  RoleArn: !GetAtt CloudFormationServiceRole.Arn
+                  StackName: !Ref AWS::StackName
+                  ChangeSetName: StackUpdate
+                  TemplatePath: !Sub BuildOutput::${TemplateName}.template
+                  TemplateConfiguration: BuildOutput::${TemplateName}.parameters
+                  Capabilities: CAPABILITY_NAMED_IAM
+                InputArtifacts:
+                  - Name: BuildOutput
+                RunOrder: 1
+            - !If
+              - useParentStack
+              - Name: ExecuteParentStackUpdate
+                ActionTypeId:
+                  Category: Deploy
+                  Owner: AWS
+                  Provider: CloudFormation
+                  Version: 1
+                Configuration:
+                  ActionMode: CHANGE_SET_EXECUTE
+                  ChangeSetName: ParentStackUpdate
+                  StackName: !Ref ParentStackName
+                RunOrder: 2
+              - Name: ExecuteStackUpdate
+                ActionTypeId:
+                  Category: Deploy
+                  Owner: AWS
+                  Provider: CloudFormation
+                  Version: 1
+                Configuration:
+                  ActionMode: CHANGE_SET_EXECUTE
+                  ChangeSetName: StackUpdate
+                  StackName: !Ref AWS::StackName
+                RunOrder: 2
+
+  CodePipelineServiceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Action:
+              - sts:AssumeRole
+            Principal:
+              Service:
+                - codepipeline.amazonaws.com
+            Effect: Allow
+      Path: /
+      Policies:
+        - PolicyName: CodePipeline
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Action:
+                  - s3:GetObject
+                  - s3:GetObjectVersion
+                  - s3:GetBucketVersioning
+                Resource:
+                  # Cannot use a reference due to cyclic dependency
+                  - !If
+                    - useParentStack
+                    - !Sub arn:aws:s3:::${ParentStackName}-*
+                    - !If
+                      - useLocalArtifactStore
+                      - !Sub arn:aws:s3:::${AWS::StackName}-*
+                      - !Sub arn:aws:s3:::${ArtifactStore}/*
+                Effect: Allow
+              - Action:
+                  - s3:PutObject
+                Resource:
+                  # Cannot use a reference due to cyclic dependency
+                  - !If
+                    - useParentStack
+                    - !Sub arn:aws:s3:::${ParentStackName}-*/${ParentStackName}-*
+                    - !If
+                      - useLocalArtifactStore
+                      - !Sub arn:aws:s3:::${AWS::StackName}-*/${AWS::StackName}-*
+                      - !Sub arn:aws:s3:::${ArtifactStore}/${AWS::StackName}-*
+                Effect: Allow
+              - Action:
+                  - codebuild:BatchGetBuilds
+                  - codebuild:StartBuild
+                Resource: '*'
+                Effect: Allow
+              - Action:
+                  - cloudformation:DescribeStacks
+                  - cloudformation:DescribeChangeSet
+                  - cloudformation:CreateChangeSet
+                  - cloudformation:ExecuteChangeSet
+                  - cloudformation:DeleteChangeSet
+                Resource:
+                  - !Sub arn:aws:cloudformation:${AWS::Region}:${AWS::AccountId}:stack/${AWS::StackName}-*
+                  - !If
+                    - useParentStack
+                    - !Sub arn:aws:cloudformation:${AWS::Region}:${AWS::AccountId}:changeSet/ParentStackUpdate/*
+                    - !Sub arn:aws:cloudformation:${AWS::Region}:${AWS::AccountId}:changeSet/StackUpdate/*
+                  - !If
+                    - useParentStack
+                    - !Sub arn:aws:cloudformation:${AWS::Region}:${AWS::AccountId}:stack/${ParentStackName}/*
+                    - !Sub arn:aws:cloudformation:${AWS::Region}:${AWS::AccountId}:stack/${AWS::StackName}/*
+                Effect: Allow
+              - Action:
+                  - iam:PassRole
+                Resource:
+                  - !If
+                    - useParentStack
+                    - !Ref CloudFormationServiceRoleArn
+                    - !GetAtt CloudFormationServiceRole.Arn
+                Effect: Allow
+              - Action:
+                  - codecommit:GetBranch
+                  - codecommit:GetCommit
+                  - codecommit:UploadArchive
+                  - codecommit:GetUploadArchiveStatus
+                  - codecommit:CancelUploadArchive
+                # XXX: Need to be specific here
+                Resource: '*'
+                Effect: Allow
+
+  CloudFormationServiceRole:
+    Condition: createCloudFormationRole
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Action:
+              - sts:AssumeRole
+            Principal:
+              Service:
+                - cloudformation.amazonaws.com
+            Effect: Allow
+      Path: /
+      Policies:
+        - PolicyName: CloudFormation
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Action:
+                  - cloudformation:DescribeStacks
+                Resource:
+                  - !Sub arn:aws:cloudformation:${AWS::Region}:${AWS::AccountId}:stack/${AWS::StackName}/*
+                Effect: Allow
+              - Action:
+                  - cloudformation:DescribeChangeSet
+                Resource:
+                  - '*'
+                Effect: Allow
+              - Action:
+                  - cloudformation:CreateChangeSet
+                Resource:
+                  - !Sub arn:aws:cloudformation:${AWS::Region}:aws:transform/Serverless-*
+                  - !Sub arn:aws:cloudformation:${AWS::Region}:${AWS::AccountId}:stack/${AWS::StackName}/*
+                Effect: Allow
+              - Action:
+                  - iam:GetRole
+                  - iam:CreateRole
+                  - iam:DeleteRole
+                  - iam:GetRolePolicy
+                  - iam:PutRolePolicy
+                  - iam:DeleteRolePolicy
+                  - iam:AttachRolePolicy
+                  - iam:DetachRolePolicy
+                Resource:
+                  # Cannot use explicit references due to cyclic dependencies
+                  - !Sub arn:aws:iam::${AWS::AccountId}:role/*
+                Effect: Allow
+              - Action:
+                  - iam:PassRole
+                Resource: !If
+                  - useCodeBuildRole
+                  - !Ref CodeBuildRoleArn
+                  - !GetAtt CodeBuildRole.Arn
+                Effect: Allow
+              - Action:
+                  - codepipeline:GetPipeline
+                  - codepipeline:CreatePipeline
+                  - codepipeline:UpdatePipeline
+                  - codepipeline:DeletePipeline
+                Resource:
+                  # Cannot use a reference due to cyclic dependency
+                  - !Sub arn:aws:codepipeline:${AWS::Region}:${AWS::AccountId}:${AWS::StackName}-*
+                Effect: Allow
+              - Action:
+                  - codebuild:CreateProject
+                  - codebuild:UpdateProject
+                  - codebuild:DeleteProject
+                  - codebuild:BatchGetProjects
+                Resource:
+                  #- !Sub 'arn:aws:codebuild:${AWS::Region}:${AWS::AccountId}:project/CodeBuild-*'
+                  - !GetAtt CodeBuild.Arn
+                Effect: Allow
+              - Action:
+                  - s3:*
+                Resource:
+                  # Cannot use a reference due to cyclic dependency
+                  #- !Sub arn:aws:s3:::${AWS::StackName}-*
+                  #- !Sub arn:aws:s3:::${AWS::StackName}-*/*
+                  - !Sub arn:aws:s3:::${ParentStackName}-*
+                  - !Sub arn:aws:s3:::${ParentStackName}-*/*
+                Effect: Allow
+              - Action:
+                  - logs:PutMetricFilter
+                  - logs:DeleteMetricFilter
+                Resource:
+                  # Cannot use a reference due to cyclic dependency
+                  - !Sub arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/codebuild/CodeBuild-*
+                  - !Sub arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/codebuild/CodeBuild-*:*
+                Effect: Allow
+#             - Action:
+#                 - events:DescribeRule
+#                 - events:PutRule
+#                 - events:DeleteRule
+#                 - events:ListRules
+#                 - events:PutTargets
+#                 - events:RemoveTargets
+#                 - events:ListTargetsByRule
+#               Resource:
+#                 - !GetAtt
+#                   - ScheduledUpdateEvent
+#                   - Arn
+#               Effect: Allow
+
+  AmazonCloudWatchEventRule:
+    Type: AWS::Events::Rule
+    Properties:
+      EventPattern:
+        source:
+          - aws.codecommit
+        detail-type:
+          - 'CodeCommit Repository State Change'
+        resources:
+          - !Sub arn:aws:codecommit:${AWS::Region}:${AWS::AccountId}:${RepositoryName}
+        detail:
+          event:
+            - referenceCreated
+            - referenceUpdated
+          referenceType:
+            - branch
+          referenceName:
+            - !Ref BranchName
+      Targets:
+        - Arn: !Sub arn:aws:codepipeline:${AWS::Region}:${AWS::AccountId}:${CodePipeline}
+          RoleArn: !GetAtt AmazonCloudWatchEventRole.Arn
+          Id: codepipeline-AppPipeline
+
+  AmazonCloudWatchEventRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Action:
+            - sts:AssumeRole
+            Principal:
+              Service:
+                - events.amazonaws.com
+            Effect: Allow
+      Path: /
+      Policies:
+        - PolicyName: TriggerCodepipeline
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Action:
+                - codepipeline:StartPipelineExecution
+                Resource: !Sub arn:aws:codepipeline:${AWS::Region}:${AWS::AccountId}:${CodePipeline}
+                Effect: Allow

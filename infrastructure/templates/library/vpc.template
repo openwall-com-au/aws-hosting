@@ -1,0 +1,484 @@
+# vim:set ft=yaml ts=2 sts=2 sw=2 et:
+---
+AWSTemplateFormatVersion: 2010-09-09
+Description: A VPC with a pair of public and private subnets per Availability Zone
+Parameters:
+  Name:
+    Description: The Name tag of the VPC (will use the name of the stack if empty)
+    Type: String
+    Default: ''
+  CidrBlock:
+    Description: The IP address range for the VPC
+    Type: String
+    MinLength: 9
+    MaxLength: 18
+    Default: 10.0.0.0/16
+    AllowedPattern: '(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})/(\d{1,2})'
+    ConstraintDescription: must be a valid IP CIDR range of the form x.x.x.x/x.
+  CidrBits:
+    Description: The size of a single subnet in CIDR bits
+    Type: Number
+    MinValue: 3
+    Default: 8
+  AvailabilityZones:
+    Description: List of Availability Zones this VPC will use (if not specified will auto-detect)
+    Type: CommaDelimitedList
+    Default: ''
+  AvailabilityZonesCount:
+    Description: Number of Availability Zones this VPC will use
+    Type: Number
+    MinValue: 1
+    Default: 2
+  EnableDnsSupport:
+    Description: Indicates whether the DNS resolution is supported for the VPC
+    Type: String
+    AllowedValues: [ true, false ]
+    Default: true
+  EnableDnsHostnames:
+    Description: Indicates whether the instances launched in the VPC get DNS hostnames
+    Type: String
+    AllowedValues: [ true, false ]
+    Default: false
+
+Conditions:
+  useAvailabilityZones: !Not [ !Equals [ '', !Join [ '', !Ref AvailabilityZones ]]]
+  useAZ9: !Equals [9, !Ref AvailabilityZonesCount]
+  useAZ8: !Or [ !Equals [ 8, !Ref AvailabilityZonesCount ], Condition: useAZ9 ]
+  useAZ7: !Or [ !Equals [ 7, !Ref AvailabilityZonesCount ], Condition: useAZ8 ]
+  useAZ6: !Or [ !Equals [ 6, !Ref AvailabilityZonesCount ], Condition: useAZ7 ]
+  useAZ5: !Or [ !Equals [ 5, !Ref AvailabilityZonesCount ], Condition: useAZ6 ]
+  useAZ4: !Or [ !Equals [ 4, !Ref AvailabilityZonesCount ], Condition: useAZ5 ]
+  useAZ3: !Or [ !Equals [ 3, !Ref AvailabilityZonesCount ], Condition: useAZ4 ]
+  useAZ2: !Or [ !Equals [ 2, !Ref AvailabilityZonesCount ], Condition: useAZ3 ]
+  useAZ1: !Or [ !Equals [ 1, !Ref AvailabilityZonesCount ], Condition: useAZ2 ]
+  useStackName: !Equals [ '', !Ref Name ]
+  useDnsResolution: !Equals [ True, !Ref EnableDnsHostnames ]
+
+Mappings:
+  AzMap:
+    '1':
+      CidrBlocks:  2
+    '2':
+      CidrBlocks:  4
+    '3':
+      CidrBlocks:  6
+    '4':
+      CidrBlocks:  8
+    '5':
+      CidrBlocks: 10
+    '6':
+      CidrBlocks: 12
+    '7':
+      CidrBlocks: 14
+    '8':
+      CidrBlocks: 16
+    '9':
+      CidrBlocks: 18
+
+Resources:
+  VPC:
+    Type: AWS::EC2::VPC
+    DeletionPolicy: Delete
+    Properties:
+      CidrBlock: !Ref CidrBlock
+      EnableDnsSupport: !If [ useDnsResolution, true, !Ref EnableDnsSupport ]
+      EnableDnsHostnames: !Ref EnableDnsHostnames
+      Tags:
+        - Key: Name
+          Value: !If [ useStackName, !Ref 'AWS::StackName', !Ref Name ]
+  subnetPublic1:
+    Condition: useAZ1
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      AvailabilityZone: !Select [ 0, !Ref AvailabilityZones ]
+      CidrBlock: !Select [ 0, !Cidr [ !Ref CidrBlock, !FindInMap [ AzMap, !Ref AvailabilityZonesCount, CidrBlocks ], !Ref CidrBits ]]
+      Tags:
+        - Key: Name
+          Value: public/a
+  subnetPrivate1:
+    Condition: useAZ1
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      AvailabilityZone: !Select [ 0, !Ref AvailabilityZones ]
+      CidrBlock: !Select [ 1, !Cidr [ !Ref CidrBlock, !FindInMap [ AzMap, !Ref AvailabilityZonesCount, CidrBlocks ], !Ref CidrBits ]]
+      Tags:
+        - Key: Name
+          Value: private/a
+  subnetPublic2:
+    Condition: useAZ2
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      AvailabilityZone: !Select [ 1, !Ref AvailabilityZones ]
+      CidrBlock: !Select [ 2, !Cidr [ !Ref CidrBlock, !FindInMap [ AzMap, !Ref AvailabilityZonesCount, CidrBlocks ], !Ref CidrBits ]]
+      Tags:
+        - Key: Name
+          Value: public/b
+  subnetPrivate2:
+    Condition: useAZ2
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      AvailabilityZone: !Select [ 1, !Ref AvailabilityZones ]
+      CidrBlock: !Select [ 3, !Cidr [ !Ref CidrBlock, !FindInMap [ AzMap, !Ref AvailabilityZonesCount, CidrBlocks ], !Ref CidrBits ]]
+      Tags:
+        - Key: Name
+          Value: private/b
+  subnetPublic3:
+    Condition: useAZ3
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      AvailabilityZone: !Select [ 2, !Ref AvailabilityZones ]
+      CidrBlock: !Select [ 4, !Cidr [ !Ref CidrBlock, !FindInMap [ AzMap, !Ref AvailabilityZonesCount, CidrBlocks ], !Ref CidrBits ]]
+      Tags:
+        - Key: Name
+          Value: public/c
+  subnetPrivate3:
+    Condition: useAZ3
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      AvailabilityZone: !Select [ 2, !Ref AvailabilityZones ]
+      CidrBlock: !Select [ 5, !Cidr [ !Ref CidrBlock, !FindInMap [ AzMap, !Ref AvailabilityZonesCount, CidrBlocks ], !Ref CidrBits ]]
+      Tags:
+        - Key: Name
+          Value: private/c
+  subnetPublic4:
+    Condition: useAZ4
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      AvailabilityZone: !Select [ 3, !Ref AvailabilityZones ]
+      CidrBlock: !Select [ 6, !Cidr [ !Ref CidrBlock, !FindInMap [ AzMap, !Ref AvailabilityZonesCount, CidrBlocks ], !Ref CidrBits ]]
+      Tags:
+        - Key: Name
+          Value: public/d
+  subnetPrivate4:
+    Condition: useAZ4
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      AvailabilityZone: !Select [ 3, !Ref AvailabilityZones ]
+      CidrBlock: !Select [ 7, !Cidr [ !Ref CidrBlock, !FindInMap [ AzMap, !Ref AvailabilityZonesCount, CidrBlocks ], !Ref CidrBits ]]
+      Tags:
+        - Key: Name
+          Value: private/d
+  subnetPublic5:
+    Condition: useAZ5
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      AvailabilityZone: !Select [ 4, !Ref AvailabilityZones ]
+      CidrBlock: !Select [ 8, !Cidr [ !Ref CidrBlock, !FindInMap [ AzMap, !Ref AvailabilityZonesCount, CidrBlocks ], !Ref CidrBits ]]
+      Tags:
+        - Key: Name
+          Value: public/e
+  subnetPrivate5:
+    Condition: useAZ5
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      AvailabilityZone: !Select [ 4, !Ref AvailabilityZones ]
+      CidrBlock: !Select [ 9, !Cidr [ !Ref CidrBlock, !FindInMap [ AzMap, !Ref AvailabilityZonesCount, CidrBlocks ], !Ref CidrBits ]]
+      Tags:
+        - Key: Name
+          Value: private/e
+  subnetPublic6:
+    Condition: useAZ6
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      AvailabilityZone: !Select [ 5, !Ref AvailabilityZones ]
+      CidrBlock: !Select [ 10, !Cidr [ !Ref CidrBlock, !FindInMap [ AzMap, !Ref AvailabilityZonesCount, CidrBlocks ], !Ref CidrBits ]]
+      Tags:
+        - Key: Name
+          Value: public/f
+  subnetPrivate6:
+    Condition: useAZ6
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      AvailabilityZone: !Select [ 5, !Ref AvailabilityZones ]
+      CidrBlock: !Select [ 11, !Cidr [ !Ref CidrBlock, !FindInMap [ AzMap, !Ref AvailabilityZonesCount, CidrBlocks ], !Ref CidrBits ]]
+      Tags:
+        - Key: Name
+          Value: private/f
+  subnetPublic7:
+    Condition: useAZ7
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      AvailabilityZone: !Select [ 6, !Ref AvailabilityZones ]
+      CidrBlock: !Select [ 12, !Cidr [ !Ref CidrBlock, !FindInMap [ AzMap, !Ref AvailabilityZonesCount, CidrBlocks ], !Ref CidrBits ]]
+      Tags:
+        - Key: Name
+          Value: public/g
+  subnetPrivate7:
+    Condition: useAZ7
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      AvailabilityZone: !Select [ 6, !Ref AvailabilityZones ]
+      CidrBlock: !Select [ 13, !Cidr [ !Ref CidrBlock, !FindInMap [ AzMap, !Ref AvailabilityZonesCount, CidrBlocks ], !Ref CidrBits ]]
+      Tags:
+        - Key: Name
+          Value: private/g
+  subnetPublic8:
+    Condition: useAZ8
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      AvailabilityZone: !Select [ 7, !Ref AvailabilityZones ]
+      CidrBlock: !Select [ 14, !Cidr [ !Ref CidrBlock, !FindInMap [ AzMap, !Ref AvailabilityZonesCount, CidrBlocks ], !Ref CidrBits ]]
+      Tags:
+        - Key: Name
+          Value: public/h
+  subnetPrivate8:
+    Condition: useAZ8
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      AvailabilityZone: !Select [ 7, !Ref AvailabilityZones ]
+      CidrBlock: !Select [ 15, !Cidr [ !Ref CidrBlock, !FindInMap [ AzMap, !Ref AvailabilityZonesCount, CidrBlocks ], !Ref CidrBits ]]
+      Tags:
+        - Key: Name
+          Value: private/h
+  subnetPublic9:
+    Condition: useAZ9
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      AvailabilityZone: !Select [ 8, !Ref AvailabilityZones ]
+      CidrBlock: !Select [ 16, !Cidr [ !Ref CidrBlock, !FindInMap [ AzMap, !Ref AvailabilityZonesCount, CidrBlocks ], !Ref CidrBits ]]
+      Tags:
+        - Key: Name
+          Value: public/i
+  subnetPrivate9:
+    Condition: useAZ9
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      AvailabilityZone: !Select [ 8, !Ref AvailabilityZones ]
+      CidrBlock: !Select [ 17, !Cidr [ !Ref CidrBlock, !FindInMap [ AzMap, !Ref AvailabilityZonesCount, CidrBlocks ], !Ref CidrBits ]]
+      Tags:
+        - Key: Name
+          Value: private/i
+
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Properties: {}
+
+  AttachGateway:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref VPC
+      InternetGatewayId: !Ref InternetGateway
+
+  RouteTablePublic:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: public
+  RouteTablePrivate:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: private
+  Route:
+    Type: AWS::EC2::Route
+    DependsOn: AttachGateway
+    Properties:
+      RouteTableId: !Ref RouteTablePublic
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+
+  SubnetRouteTableAssociation1pub:
+    Condition: useAZ1
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref subnetPublic1
+      RouteTableId: !Ref RouteTablePublic
+  SubnetRouteTableAssociation2pub:
+    Condition: useAZ2
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref subnetPublic2
+      RouteTableId: !Ref RouteTablePublic
+  SubnetRouteTableAssociation3pub:
+    Condition: useAZ3
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref subnetPublic3
+      RouteTableId: !Ref RouteTablePublic
+  SubnetRouteTableAssociation4pub:
+    Condition: useAZ4
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref subnetPublic4
+      RouteTableId: !Ref RouteTablePublic
+  SubnetRouteTableAssociation5pub:
+    Condition: useAZ5
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref subnetPublic5
+      RouteTableId: !Ref RouteTablePublic
+  SubnetRouteTableAssociation6pub:
+    Condition: useAZ6
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref subnetPublic6
+      RouteTableId: !Ref RouteTablePublic
+  SubnetRouteTableAssociation7pub:
+    Condition: useAZ7
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref subnetPublic7
+      RouteTableId: !Ref RouteTablePublic
+  SubnetRouteTableAssociation8pub:
+    Condition: useAZ8
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref subnetPublic8
+      RouteTableId: !Ref RouteTablePublic
+  SubnetRouteTableAssociation9pub:
+    Condition: useAZ9
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref subnetPublic9
+      RouteTableId: !Ref RouteTablePublic
+  SubnetRouteTableAssociation1pvt:
+    Condition: useAZ1
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref subnetPrivate1
+      RouteTableId: !Ref RouteTablePrivate
+  SubnetRouteTableAssociation2pvt:
+    Condition: useAZ2
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref subnetPrivate2
+      RouteTableId: !Ref RouteTablePrivate
+  SubnetRouteTableAssociation3pvt:
+    Condition: useAZ3
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref subnetPrivate3
+      RouteTableId: !Ref RouteTablePrivate
+  SubnetRouteTableAssociation4pvt:
+    Condition: useAZ4
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref subnetPrivate4
+      RouteTableId: !Ref RouteTablePrivate
+  SubnetRouteTableAssociation5pvt:
+    Condition: useAZ5
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref subnetPrivate5
+      RouteTableId: !Ref RouteTablePrivate
+  SubnetRouteTableAssociation6pvt:
+    Condition: useAZ6
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref subnetPrivate6
+      RouteTableId: !Ref RouteTablePrivate
+  SubnetRouteTableAssociation7pvt:
+    Condition: useAZ7
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref subnetPrivate7
+      RouteTableId: !Ref RouteTablePrivate
+  SubnetRouteTableAssociation8pvt:
+    Condition: useAZ8
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref subnetPrivate8
+      RouteTableId: !Ref RouteTablePrivate
+  SubnetRouteTableAssociation9pvt:
+    Condition: useAZ9
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref subnetPrivate9
+      RouteTableId: !Ref RouteTablePrivate
+
+Outputs:
+  VpcId:
+    Description: The ID of the created VPC
+    Value: !Ref VPC
+  SubnetPublicIds:
+    Description: A comma delimited list of all public subnets in the VPC
+    Value: !Join
+      - ','
+      - - !If [ useAZ1, !Ref subnetPublic1, !Ref 'AWS::NoValue' ]
+        - !If [ useAZ2, !Ref subnetPublic2, !Ref 'AWS::NoValue' ]
+        - !If [ useAZ3, !Ref subnetPublic3, !Ref 'AWS::NoValue' ]
+        - !If [ useAZ4, !Ref subnetPublic4, !Ref 'AWS::NoValue' ]
+        - !If [ useAZ5, !Ref subnetPublic5, !Ref 'AWS::NoValue' ]
+        - !If [ useAZ6, !Ref subnetPublic6, !Ref 'AWS::NoValue' ]
+        - !If [ useAZ7, !Ref subnetPublic7, !Ref 'AWS::NoValue' ]
+        - !If [ useAZ8, !Ref subnetPublic8, !Ref 'AWS::NoValue' ]
+        - !If [ useAZ9, !Ref subnetPublic9, !Ref 'AWS::NoValue' ]
+  SubnetPrivateIds:
+    Description: A comma delimited list of all private subnets in the VPC
+    Value: !Join 
+      - ','
+      - - !If [ useAZ1, !Ref subnetPrivate1, !Ref 'AWS::NoValue' ]
+        - !If [ useAZ2, !Ref subnetPrivate2, !Ref 'AWS::NoValue' ]
+        - !If [ useAZ3, !Ref subnetPrivate3, !Ref 'AWS::NoValue' ]
+        - !If [ useAZ4, !Ref subnetPrivate4, !Ref 'AWS::NoValue' ]
+        - !If [ useAZ5, !Ref subnetPrivate5, !Ref 'AWS::NoValue' ]
+        - !If [ useAZ6, !Ref subnetPrivate6, !Ref 'AWS::NoValue' ]
+        - !If [ useAZ7, !Ref subnetPrivate7, !Ref 'AWS::NoValue' ]
+        - !If [ useAZ8, !Ref subnetPrivate8, !Ref 'AWS::NoValue' ]
+        - !If [ useAZ9, !Ref subnetPrivate9, !Ref 'AWS::NoValue' ]
+  SubnetIds:
+    Description: A comma delimited list of all subnets in the VPC
+    Value: !Join 
+      - ','
+      - - !If [ useAZ1, !Ref subnetPublic1, !Ref 'AWS::NoValue' ]
+        - !If [ useAZ1, !Ref subnetPrivate1, !Ref 'AWS::NoValue' ]
+        - !If [ useAZ2, !Ref subnetPublic2, !Ref 'AWS::NoValue' ]
+        - !If [ useAZ2, !Ref subnetPrivate2, !Ref 'AWS::NoValue' ]
+        - !If [ useAZ3, !Ref subnetPublic3, !Ref 'AWS::NoValue' ]
+        - !If [ useAZ3, !Ref subnetPrivate3, !Ref 'AWS::NoValue' ]
+        - !If [ useAZ4, !Ref subnetPublic4, !Ref 'AWS::NoValue' ]
+        - !If [ useAZ4, !Ref subnetPrivate4, !Ref 'AWS::NoValue' ]
+        - !If [ useAZ5, !Ref subnetPublic5, !Ref 'AWS::NoValue' ]
+        - !If [ useAZ5, !Ref subnetPrivate5, !Ref 'AWS::NoValue' ]
+        - !If [ useAZ6, !Ref subnetPublic6, !Ref 'AWS::NoValue' ]
+        - !If [ useAZ6, !Ref subnetPrivate6, !Ref 'AWS::NoValue' ]
+        - !If [ useAZ7, !Ref subnetPublic7, !Ref 'AWS::NoValue' ]
+        - !If [ useAZ7, !Ref subnetPrivate7, !Ref 'AWS::NoValue' ]
+        - !If [ useAZ8, !Ref subnetPublic8, !Ref 'AWS::NoValue' ]
+        - !If [ useAZ8, !Ref subnetPrivate8, !Ref 'AWS::NoValue' ]
+        - !If [ useAZ9, !Ref subnetPublic9, !Ref 'AWS::NoValue' ]
+        - !If [ useAZ9, !Ref subnetPrivate9, !Ref 'AWS::NoValue' ]
+  RouteTablePublicId:
+    Description: The routing table for public subnets
+    Value: !Ref RouteTablePublic
+  RouteTablePrivateId:
+    Description: The routing table for private subnets
+    Value: !Ref RouteTablePrivate
+  RouteTableIds:
+    Description: A comma delimited list of all route tables in the VPC
+    Value: !Join 
+      - ','
+      - - !Ref RouteTablePublic
+        - !Ref RouteTablePrivate
+  DefaultNetworkAclId:
+    Description: The default Network ACL
+    Value: !GetAtt 
+      - VPC
+      - DefaultNetworkAcl
+  DefaultSecurityGroupId:
+    Description: The default security group
+    Value: !GetAtt 
+      - VPC
+      - DefaultSecurityGroup

@@ -1,0 +1,15 @@
+#!/bin/bash
+set -exu -o pipefail
+PS4='+ [\t]	'
+
+apt-get update
+apt-get -y install \
+	nfs-common \
+	awscli \
+	adcli \
+	ldap-utils \
+	krb5-user \
+	python-sss \
+	jq \
+	smbclient \
+	# openssh-server openssh-client

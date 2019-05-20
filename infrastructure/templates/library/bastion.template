@@ -1,0 +1,214 @@
+# vim:set ft=yaml ts=2 sts=2 sw=2 et:
+AWSTemplateFormatVersion: 2010-09-09
+Description: Bastion
+Parameters:
+  ImageId:
+    Description: >-
+      The AMI ID to use to launch the instance (should support cloud-init, if
+      left empty a CentOS 7 AMI will be created)
+    Type: String
+    Default: ''
+  InstanceType:
+    Description: Type of the instance to launch
+    Type: String
+    Default: t3.nano
+  KeyName:
+    Description: Key pair to install by default (if empty no SSH login will be possible
+    Type: AWS::EC2::KeyPair::KeyName
+    Default: ''
+  SecurityGroupIds:
+    Description: The comma delimited list of Security Group Ids to assign to the instance
+    Type: List<AWS::EC2::SecurityGroup::Id>
+  SubnetPublicIds:
+    Description: >-
+      A list of public subnet Ids where the auto-scaling group will launch NAT
+      instances
+    Type: List<AWS::EC2::Subnet::Id>
+  InstanceMonitoring:
+    Type: String
+    AllowedValues:
+      - True
+      - False
+    Default: False
+  CfnLibraryBucket:
+    Description: >-
+      The name of the S3 bucket storing the tempate library for the nested
+      stacks
+    Type: String
+    Default: ''
+  UserData:
+    Description: >-
+      Data to be provided to the instance (will be appended to the NAT
+      initialisation)
+    Type: String
+    Default: ''
+
+Conditions:
+  useImageId: !Equals [ '', !Ref ImageId ]
+  useKeyName: !Not [ !Equals [ '', !Ref KeyName ]]
+  useCfnLibrary: !Not [ !Equals [ '', !Ref CfnLibraryBucket ]]
+  createAmi: !And [ !Not [ Condition: useImageId ], Condition: useCfnLibrary ]
+  isNested: !Not [ !Equals [ !Ref 'AWS::StackName', !Select [ 0, !Split [ '-', !Select [ 1, !Split [ '/', !Ref 'AWS::StackId' ]]]]]]
+
+Resources:
+
+  Image:
+    Condition: createAmi
+    Type: AWS::CloudFormation::Stack
+    Properties:
+      TemplateURL: !Sub https://s3-${AWS::Region}.amazonaws.com/${CfnLibraryBucket}/ami.template
+      Parameters:
+        SubnetId: !Select [ 0, !Ref SubnetPublicIds ]
+      TimeoutInMinutes: '60'
+
+  InstanceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Statement:
+          - Action:
+              - sts:AssumeRole
+            Principal:
+              Service:
+                - ec2.amazonaws.com
+            Effect: Allow
+      Path: /
+      Policies:
+        - PolicyDocument:
+            Statement:
+              - Action:
+                  - autoscaling:SetInstanceHealth
+                Resource: '*'
+                Effect: Allow
+              - Action:
+                  - cloudformation:SignalResource
+                Resource: !Sub arn:aws:cloudformation:${AWS::Region}:${AWS::AccountId}:stack/${AWS::StackName}/*
+                Effect: Allow
+          PolicyName: BastionRolePolicy
+
+  InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Path: /
+      Roles:
+        - !Ref InstanceRole
+
+  LaunchConfiguration:
+    Type: AWS::AutoScaling::LaunchConfiguration
+    Properties:
+      IamInstanceProfile: !Ref InstanceProfile
+      ImageId: !If [ createAmi, !GetAtt [ Image,  Outputs.GeneratedAmi.AmiId ], !Ref ImageId ]
+      InstanceType: !Ref InstanceType
+      KeyName: !If [ useKeyName, !Ref KeyName, !Ref 'AWS::NoValue' ]
+      AssociatePublicIpAddress: True
+      SecurityGroups: !Ref SecurityGroupIds
+      InstanceMonitoring: !Ref InstanceMonitoring
+      UserData: !If
+        - createAmi
+        - Fn::Base64: !Sub |
+            #!/bin/bash
+            SYS_PKGS='cloud-init unzip passwd sudo epel-release'
+            SYS_SVCS='cloud-config cloud-init cloud-init-local cloud-final awscli'
+            safe_yum()
+            {
+              I=0
+              while :; do
+                if ! yum "$@"; then
+                  [ $I -lt 2 ] && I=$((I + 1)) || exit 1
+                  sleep 15
+                  continue
+                fi
+                break
+              done
+            }
+            systemctl start authorize-ssh-key.service
+            set -xeuo pipefail
+            printf 'users: ""
+            disable_root: 0
+            ' > /etc/cloud/cloud.cfg.d/99_local.cfg
+            export AWS_DEFAULT_REGION='${AWS::Region}'
+            INSTANCE_ID=$(curl -qsS4f --retry 60 --retry-delay 1 'http://169.254.169.254/latest/meta-data/instance-id')
+            cat << __EOF__ > /etc/systemd/system/local-cleanup.service
+            [Unit]
+            Description="Bootstrap Cleanup"
+            After=cloud-final.service
+            ConditionVirtualization=xen
+
+            [Service]
+            Type=oneshot
+            EnvironmentFile=-/run/ec2-user-data.env
+            ExecStart=/bin/sh -c 'yum -y remove cloud-init passwd sudo' && userdel -r centos && exec rm -rf /var/lib/cloud /root/.ssh'
+            ExecStartPost=/usr/bin/systemctl disable local-cleanup.service local-cleanup.timer
+            ExecStartPost=/usr/bin/rm -- /etc/systemd/system/local-cleanup.service /etc/systemd/system/local-cleanup.timer
+            __EOF__
+            cat << __EOF__ > /etc/systemd/system/local-cleanup.timer
+            [Unit]
+            Description="Delayed start of Bootstrap Cleanup"
+
+            [Timer]
+            OnActiveSec=1min
+            Unit=local-cleanup.service
+
+            [Install]
+            WantedBy=timers.target
+            __EOF__
+            chmod 0644 /etc/systemd/system/local-cleanup.*
+
+            ${UserData}
+
+            aws cloudformation signal-resource --stack-name '${AWS::StackName}' --logical-resource-id AutoScalingGroup --unique-id "$INSTANCE_ID" --status SUCCESS
+            systemctl start local-cleanup.timer
+        - Fn::Base64: !Sub |
+            STACK_NAME="${AWS::StackName}"
+            ${UserData}
+
+  AutoScalingGroup:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    CreationPolicy:
+      ResourceSignal:
+        Count: 1
+        Timeout: PT15M
+    Properties:
+      LaunchConfigurationName: !Ref LaunchConfiguration
+      MaxSize: 2
+      MinSize: 1
+      DesiredCapacity: 1
+      HealthCheckGracePeriod: 5
+      Cooldown: 300
+      HealthCheckType: EC2
+      VPCZoneIdentifier: !Ref SubnetPublicIds
+      Tags:
+        - Key: Name
+          Value: !If
+            - isNested
+            - !Join [ '/', [ !Select [ 0, !Split [ '-', !Select [ 1, !Split [ '/', !Ref 'AWS::StackId' ]]]], bastion ]]
+            - bastion
+          PropagateAtLaunch: True
+    UpdatePolicy:
+      AutoScalingScheduledAction:
+        IgnoreUnmodifiedGroupSizeProperties: True
+      AutoScalingRollingUpdate:
+        MinInstancesInService: 1
+        MaxBatchSize: 1
+        WaitOnResourceSignals: True
+        PauseTime: PT10M
+
+Outputs:
+  InstanceRole:
+    Description: The role assigned to the Bastion instances
+    Value: !Ref InstanceRole
+  InstanceRoleArn:
+    Description: The ARN of the role assigned to the Bastion instances
+    Value: !GetAtt InstanceRole.Arn
+  InstanceProfile:
+    Description: The IAM instance profile assigned to the Bastion instances
+    Value: !Ref InstanceProfile
+  InstanceProfileArn:
+    Description: The ARN of the IAM instance profile assigned to the Bastion instances
+    Value: !GetAtt InstanceProfile.Arn
+  LaunchConfiguration:
+    Description: The launch configuration for the Bastion autoscaling group
+    Value: !Ref LaunchConfiguration
+  AutoScalingGroup:
+    Description: The AutoScaling Group for the Bastion instances
+    Value: !Ref AutoScalingGroup
