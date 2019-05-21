@@ -56,7 +56,7 @@ To instantiate a web hosting platform the following steps are required:
 5. Retrieve the output of the recently deployed stack to get the name of the
    bucket and the URL of the repository.
 
-       aws describe-stacks --stack-name next --query 'Stacks[0].Outputs[?OutputKey == `ArtifactStore` || OutputKey == `RepositoryUrl`][OutputKey, OutputValue]' --output text --stack-name <STACK_NAME>
+       aws describe-stacks --query 'Stacks[0].Outputs[?OutputKey == `ArtifactStore` || OutputKey == `RepositoryUrl`][OutputKey, OutputValue]' --output text --stack-name <STACK_NAME>
  
    This will produce output like the following:
    
