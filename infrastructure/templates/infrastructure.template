@@ -1517,6 +1517,15 @@ Resources:
                   # XXX: needs a condition to confine this
                 Effect: Allow
               - Action:
+                  - kms:CreateAlias
+                  - kms:UpdateAlias
+                  - kms:DeleteAlias
+                  - kms:ScheduleKeyDeletion
+                Resource:
+                  - !Sub arn:aws:kms:${AWS::Region}:${AWS::AccountId}:alias/${AWS::StackName}-key*
+                  - !Sub arn:aws:kms:${AWS::Region}:${AWS::AccountId}:key/*
+                Effect: Allow
+              - Action:
                   - ec2:DescribeAccountAttributes
                   - ec2:DescribeAvailabilityZones
                   - ec2:DescribeSubnets
