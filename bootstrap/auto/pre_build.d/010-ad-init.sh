@@ -83,7 +83,8 @@ PDC_DNS=$(host -r -s -t srv "_kerberos._tcp.${AD_DOMAIN}" | sed -n 's,^_kerberos
 echo "Ensuring that AD Joiner password is not empty"
 [ -n "$JOINER_PASS" ]
 echo "Setting the AD Joiner password in the directory"
-rpcclient -s /dev/null --option=security=ads -k -c "setuserinfo2 Joiner 23 $JOINER_PASS" "$PDC_DNS"
+rpcclient -s /dev/null --option=security=ads -k -c 'setuserinfo2 Joiner 23 T3mpP4$$w0rd' "$PDC_DNS"
+rpcclient -s /dev/null --option=security=ads -k -c "chgpasswd3 Joiner T3mpP4\$\$w0rd $JOINER_PASS" "$PDC_DNS"
 unset PDC_DNS
 
 [ "$SETOLD" == "$-" ] || set -x
