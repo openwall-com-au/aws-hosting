@@ -126,7 +126,7 @@ After=ec2-user-data.service
 [Service]
 EnvironmentFile=/run/ec2-user-data.env
 ExecStart=
-ExecStart=/usr/lib/systemd/systemd-socket-proxyd ${PHP_FPM_LB}:${PHP_FPM_LB_PORT}
+ExecStart=/usr/lib/systemd/systemd-socket-proxyd ${PHP_DNS}:${PHP_PORT}
 __EOF__
 chmod 0644 "$BOOTSTRAP_MNT"/etc/systemd/system/systemd-socket-proxyd\@.service.d/userdata.conf
 chown -h root:root "$BOOTSTRAP_MNT"/etc/systemd/system/systemd-socket-proxyd\@.service.d/userdata.conf
