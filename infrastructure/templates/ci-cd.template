@@ -60,6 +60,10 @@ Parameters:
     Description: A role CodeBuild will assume to launch and run agents
     Type: String
     Default: ''
+  TriggerCodePipeline:
+    Description: A name of a CodePipeline which successful execution will trigger this pipeline execution
+    Type: String
+    Default: ''
 
 Conditions:
   useParentStack: !Not [ !Equals [ '', !Ref ParentStackName ]]
@@ -70,6 +74,7 @@ Conditions:
   useCodeBuildEnvironment: !Not [ !Equals [ '', !Join ['', !Ref CodeBuildEnvironment ]]]
   useCodeBuildRole: !Not [ !Equals [ '', !Ref CodeBuildRoleArn ]]
   useBuildSpec: !Not [ !Equals [ '', !Ref BuildSpec ]]
+  useTriggerCodePipeline: !Not [ !Equals [ '', !Ref TriggerCodePipeline ]]
   createCodeBuildRole: !Equals [ '', !Ref CodeBuildRoleArn ]
   createCloudFormationRole: !Equals [ '', !Ref ParentStackName ]
 
@@ -553,7 +558,7 @@ Resources:
 #                   - Arn
 #               Effect: Allow
 
-  AmazonCloudWatchEventRule:
+  eventRuleCodeCommit:
     Type: AWS::Events::Rule
     Properties:
       EventPattern:
@@ -574,7 +579,28 @@ Resources:
       Targets:
         - Arn: !Sub arn:aws:codepipeline:${AWS::Region}:${AWS::AccountId}:${CodePipeline}
           RoleArn: !GetAtt AmazonCloudWatchEventRole.Arn
-          Id: codepipeline-AppPipeline
+          Id: codepipeline-CICD-commit
+
+  eventRuleCodePipeline:
+    Condition: useTriggerCodePipeline
+    Type: AWS::Events::Rule
+    Properties:
+      EventPattern:
+        source:
+          - aws.codepipeline
+        detail-type:
+          - 'CodePipeline Pipeline Execution State Change'
+        detail:
+          pipeline:
+            - !Ref TriggerCodePipeline
+          state:
+            - SUCCEEDED
+        region:
+          - !Ref AWS::Region
+      Targets:
+        - Arn: !Sub arn:aws:codepipeline:${AWS::Region}:${AWS::AccountId}:${CodePipeline}
+          RoleArn: !GetAtt AmazonCloudWatchEventRole.Arn
+          Id: codepipeline-CICD-images
 
   AmazonCloudWatchEventRole:
     Type: AWS::IAM::Role
