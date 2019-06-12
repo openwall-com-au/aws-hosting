@@ -8,6 +8,7 @@ upload_bootstrap_snippet()
 	[ "${SETOLD//x}" == "$-" ] || set +x
 	AD_JOIN_PASS_SAFE="${AD_JOIN_PASS//\"/\\\"}"
 	AD_JOIN_PASS_SAFE="${AD_JOIN_PASS_SAFE//|/\\|}"
+	AD_JOIN_PASS_SAFE="${AD_JOIN_PASS_SAFE//&/\\&}"
 	sed -i "
 		s|@@AD_DOMAIN@@|$AD_DOMAIN|g
 		s|@@AD_JOIN_USER@@|$AD_JOIN_USER|g

@@ -1206,9 +1206,146 @@ Resources:
               - !GetAtt [ keyCustom, Outputs.KeyId ]
               - !Ref 'AWS::NoValue'
           - !Ref 'AWS::NoValue'
+        TriggerCodePipeline: !GetAtt [ AmiCreator, Outputs.CodePipeline ]
 
+  UpdateStackAmiIds:
+    DependsOn:
+      - ssmBastionAmiId
+      - ssmAppAmiId
+      - ssmWebAmiId
+    Type: AWS::Lambda::Function
+    Properties:
+      Code:
+        ZipFile: !Sub |
+          import io
+          import json
+          import zipfile
+          import boto3
+          import botocore
+
+          def _get_user_parameters(job_data):
+              configuration = job_data['actionConfiguration']['configuration']
+              user_parameters = configuration['UserParameters']
+              decoded_parameters = json.loads(user_parameters)
+              return decoded_parameters
+
+          def create_s3_client(job_data):
+              key_id = job_data['artifactCredentials']['accessKeyId']
+              key_secret = job_data['artifactCredentials']['secretAccessKey']
+              session_token = job_data['artifactCredentials']['sessionToken']
+
+              session = boto3.Session(
+                  aws_access_key_id=key_id,
+                  aws_secret_access_key=key_secret,
+                  aws_session_token=session_token
+              )
+              client = session.client(
+                  's3',
+                  config=botocore.client.Config(signature_version='s3v4')
+              )
+              return client
+
+          def _fetch_artifact(s3, artifact):
+              bucket = artifact['location']['s3Location']['bucketName']
+              key = artifact['location']['s3Location']['objectKey']
+
+              args = {
+                  'Key': key,
+                  'Bucket': bucket
+              }
+              response = s3.get_object(**args)
+
+              body = response['Body']
+              body_bytes = io.BytesIO(body.read())
+              name = artifact['name']
+              return name, body_bytes
+
+          def handler(event, context):
+              code_pipeline = boto3.client('codepipeline')
+              job_id = event['CodePipeline.job']['id']
+              try:
+                  job_data = event['CodePipeline.job']['data']
+                  params = _get_user_parameters(job_data)
+                  s3 = create_s3_client(job_data)
+                  ssm = boto3.client('ssm')
+                  artifacts = job_data['inputArtifacts']
+
+                  for artifact in artifacts:
+                      artifact_name, artifact_data = _fetch_artifact(s3, artifact)
+                      with zipfile.ZipFile(artifact_data, 'r') as src_zfile:
+                          if artifact_name in params['mapping'].keys():
+                              print('Processing: {}'.format(artifact_name))
+                              data = json.loads(src_zfile.read(params['mapping'][artifact_name]['file']))
+                              print('Got data: {}'.format(data))
+                              parameter = params['mapping'][artifact_name]['parameter']
+                              value = data[params['mapping'][artifact_name]['key']]
+                              parameter = ssm.put_parameter(
+                                  Name='/${AWS::StackName}/config/ami/{}'.format(parameter),
+                                  Description='AMI ID for the {} instances'.format(parameter),
+                                  Type='String',
+                                  Overwrite=True,
+                                  AllowedPattern='ami-\p{XDigit}{8,}',
+                                  Value=value
+                              )
+
+                  code_pipeline.put_job_success_result(
+                      jobId=job_id,
+                  )
+              except Exception as e:
+                  code_pipeline.put_job_failure_result(
+                      jobId=job_id,
+                      failureDetails={
+                          'type': 'JobFailed',
+                          'message': str(e)
+                      }
+                  )
+                  raise e
+              return "Complete."
+      Handler: index.handler
+      Runtime: python3.7
+      Timeout: 10
+      Role: !GetAtt
+        - LER
+        - Arn
+
+  LER:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      Path: /
+      Policies:
+        - PolicyName: !Sub '${AWS::StackName}-LERP'
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource:
+                  - !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/${AWS::StackName}-UpdateStackAmiIds-*'
+                Effect: Allow
+              - Action:
+                  - codepipeline:PutJobSuccessResult
+                  - codepipeline:PutJobFailureResult
+                Resource: '*'
+                Effect: Allow
+              - Action:
+                  - ssm:GetParameter
+                  - ssm:PutParameter
+                  - ssm:DeleteParameter
+                Resource:
+                  - !Sub arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/${AWS::StackName}/config/ami/*
+                Effect: Allow
   AmiCreator:
-    DependsOn: CD
     Type: AWS::CloudFormation::Stack
     Properties:
       TemplateURL: ami-creator.template
@@ -1218,6 +1355,7 @@ Resources:
         ArtifactStore: !Ref ArtifactStore
         ParentStackName: !Ref AWS::StackName
         ParentStackRoleArn: !GetAtt CloudFormationServiceRole.Arn
+        LambdaName: !Ref UpdateStackAmiIds
         CodeBuildEnvironment: !Join
           - ','
           - - !Sub SECRET_AD_JOIN_ARN=${secretDirectoryJoiner}
@@ -1242,6 +1380,48 @@ Resources:
           - !Join [ ',', !Ref AvailabilityZones ]
           - !Join [ ',', !GetAZs '' ]
         AvailabilityZonesCount: !Ref AvailabilityZonesCount
+
+  ssmBastionAmiId:
+    #Condition: useBastionImageId
+    DependsOn: StackRole
+    Type: AWS::SSM::Parameter
+    Properties:
+      Description: AMI ID for the bastion instances
+      Name: !Sub /${AWS::StackName}/config/ami/bastion
+      Type: String
+      Value: !If
+        - useBastionImageId
+        - !Ref BastionImageId
+        - undefined
+      AllowedPattern: (undefined|ami-\p{XDigit}{8,})
+
+  ssmAppAmiId:
+    #Condition: useAppImageId
+    DependsOn: StackRole
+    Type: AWS::SSM::Parameter
+    Properties:
+      Description: AMI ID for the app instances
+      Name: !Sub /${AWS::StackName}/config/ami/app
+      Type: String
+      Value: !If
+        - useAppImageId
+        - !Ref AppImageId
+        - undefined
+      AllowedPattern: (undefined|ami-\p{XDigit}{8,})
+
+  ssmWebAmiId:
+    #Condition: useWebImageId
+    DependsOn: StackRole
+    Type: AWS::SSM::Parameter
+    Properties:
+      Description: AMI ID for the web instances
+      Name: !Sub /${AWS::StackName}/config/ami/web
+      Type: String
+      Value: !If
+        - useWebImageId
+        - !Ref WebImageId
+        - undefined
+      AllowedPattern: (undefined|ami-\p{XDigit}{8,})
 
   CodeBuildRole:
     Type: AWS::IAM::Role
@@ -1368,6 +1548,11 @@ Resources:
                         - !Ref 'AWS::NoValue'
                 Effect: Allow
               - Action:
+                - ssm:GetParameter
+                Resource:
+                  - !Sub arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/${AWS::StackName}/*
+                Effect: Allow
+              - Action:
                   - secretsmanager:GetSecretValue
                 Resource:
                   - !Ref secretDirectory
@@ -1465,6 +1650,9 @@ Resources:
                 - ssm:GetParameter
                 - ssm:PutParameter
                 - ssm:DeleteParameter
+                - ssm:AddTagsToResource
+                - ssm:ListTagsToResource
+                - ssm:RemoveTagsToResource
                 Resource:
                   - !Sub arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/${AWS::StackName}/*
                   - !Sub arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/aws/reference/secretsmanager/${AWS::StackName}/*

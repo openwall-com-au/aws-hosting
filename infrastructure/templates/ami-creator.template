@@ -49,6 +49,10 @@ Parameters:
     Type: Number
     MinValue: 1
     Default: 2
+  LambdaName:
+    Description: The name of the Lambda function that will be called to update AMI IDs
+    Type: String
+    Default: ''
 
 Conditions:
   useAvailabilityZones: !Not [ !Equals [ '', !Join [ '', !Ref AvailabilityZones ]]]
@@ -66,6 +70,7 @@ Conditions:
   useParentStack: !Not [ !Equals [ '', !Ref ParentStackName ]]
   useCodeBuildEnvironment: !Not [ !Equals [ '', !Join ['', !Ref CodeBuildEnvironment ]]]
   useCodeBuildRole: !Not [ !Equals [ '', !Ref CodeBuildRoleArn ]]
+  useLambda: !Not [ !Equals [ '', !Ref LambdaName ]]
   createCodeBuildRole: !Equals [ '', !Ref CodeBuildRoleArn ]
 
 Resources:
@@ -477,46 +482,42 @@ Resources:
                 StackName: !Sub '${AWS::StackName}-vpc'
               RunOrder: 5
         - !If
-          - useParentStack
-          - Name: Deploy
+          - useLambda
+          - Name: UpdateStackAmiIds
             Actions:
               - Name: PrepareUpdate
                 ActionTypeId:
-                  Category: Deploy
+                  Category: Invoke
                   Owner: AWS 
-                  Provider: CloudFormation
+                  Provider: Lambda
                   Version: 1
                 Configuration:
-                  ActionMode: CHANGE_SET_REPLACE
-                  RoleArn: !Ref ParentStackRoleArn
-                  StackName: !Ref ParentStackName
-                  ChangeSetName: !Ref ParentStackName
-                  TemplatePath: BuildOutput::update.template
-                  TemplateConfiguration: BuildOutput::update.parameters
-                  ParameterOverrides: |
+                  FunctionName: !Ref LambdaName
+                  UserParameters: |
                     {
-                      "BastionImageId" : { "Fn::GetParam" : [ "BastionStackOutput", "bastion-ami-output.json", "AmiId" ]},
-                      "AppImageId" : { "Fn::GetParam" : [ "AppStackOutput", "app-ami-output.json", "AmiId" ]},
-                      "WebImageId" : { "Fn::GetParam" : [ "WebStackOutput", "web-ami-output.json", "AmiId" ]}
+                      "mapping": {
+                        "BastionStackOutput": {
+                          "file": "bastion-ami-output.json",
+                          "key": "AmiId",
+                          "parameter": "bastion"
+                        },
+                        "AppStackOutput": {
+                          "file": "app-ami-output.json",
+                          "key": "AmiId",
+                          "parameter": "app"
+                        },
+                        "WebStackOutput": {
+                          "file": "web-ami-output.json",
+                          "key": "AmiId",
+                          "parameter": "web"
+                        }
+                      }
                     }
-                  Capabilities: CAPABILITY_NAMED_IAM
                 InputArtifacts:
-                  - Name: BuildOutput
                   - Name: BastionStackOutput
                   - Name: AppStackOutput
                   - Name: WebStackOutput
                 RunOrder: 1
-              - Name: ExecuteUpdate
-                ActionTypeId:
-                  Category: Deploy
-                  Owner: AWS
-                  Provider: CloudFormation
-                  Version: 1
-                Configuration:
-                  ActionMode: CHANGE_SET_EXECUTE
-                  ChangeSetName: !Ref ParentStackName
-                  StackName: !Ref ParentStackName
-                RunOrder: 6
           - !Ref AWS::NoValue
 
   CodePipelineServiceRole:
@@ -615,6 +616,13 @@ Resources:
                 # XXX: Need to be specific here
                 Resource: '*'
                 Effect: Allow
+              - "Fn::If":
+                - useLambda
+                - Action:
+                    - lambda:InvokeFunction
+                  Resource: '*'
+                  Effect: Allow
+                - !Ref AWS::NoValue
 
   CloudFormationServiceRole:
     Type: AWS::IAM::Role
@@ -878,3 +886,7 @@ Resources:
 #             "ssh_url": "git@github.com:devpanel/devpanel.git"
 #           }
 
+Outputs:
+  CodePipeline:
+    Value: !Ref CodePipeline
+    Description: The name of the CodePipeline
